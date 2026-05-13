@@ -41,14 +41,17 @@ def capture_markdown_for_entry(entry, data_dir, force=False):
         access_requirement = detect_content_access_requirement(entry, result)
         if access_requirement:
             markdown_info = write_markdown(entry, result, data_dir) if result.get("text") or result.get("images") else {}
+            html_path = write_html_snapshot(entry, result.get("rawHtml") or "", data_dir)
             entry["content"] = {
                 "status": "needs_login",
                 "format": "markdown",
                 "reason": access_requirement,
                 "partial": True,
                 "markdownPath": markdown_info.get("markdownPath", ""),
+                "htmlPath": html_path,
                 "assetsPath": markdown_info.get("assetsPath", ""),
                 "imageCount": markdown_info.get("imageCount", 0),
+                "finalUrl": result.get("finalUrl") or "",
                 "capturedAt": now_ms(),
             }
             return entry
@@ -63,12 +66,17 @@ def capture_markdown_for_entry(entry, data_dir, force=False):
             return entry
 
         markdown_info = write_markdown(entry, result, data_dir)
+        html_path = write_html_snapshot(entry, result.get("rawHtml") or "", data_dir)
         entry["content"] = {
             "status": "ready",
             "format": "markdown",
             "markdownPath": markdown_info["markdownPath"],
+            "htmlPath": html_path,
             "assetsPath": markdown_info.get("assetsPath", ""),
             "imageCount": markdown_info["imageCount"],
+            "finalUrl": result.get("finalUrl") or "",
+            "siteName": result.get("siteName") or "",
+            "description": result.get("description") or "",
             "capturedAt": now_ms(),
         }
     except Exception as error:
@@ -198,7 +206,10 @@ def existing_markdown_path(entry, data_dir):
 
 
 def write_browser_html_snapshot(entry, browser_result, data_dir):
-    html = browser_result.get("html") or ""
+    return write_html_snapshot(entry, browser_result.get("html") or "", data_dir)
+
+
+def write_html_snapshot(entry, html, data_dir):
     if not html:
         return ""
 
@@ -828,9 +839,10 @@ def crawl_article_page(entry):
             "images": [],
         }
 
-    block = select_article_block(html, entry.get("sourceKey"))
+    clean_html = strip_noise_html(html)
+    block = select_article_block(clean_html, entry.get("sourceKey"))
     if not block:
-        block = html
+        block = clean_html
 
     text = html_to_text(block)
     images = extract_images(block, final_url)
@@ -846,15 +858,19 @@ def crawl_article_page(entry):
         or entry.get("title")
         or ""
     )
+    site_name = find_meta_content(html, "property", "og:site_name") or (urlparse(final_url).hostname or "")
+    description = find_meta_content(html, "property", "og:description") or find_meta_content(html, "name", "description")
     author = (
         find_meta_content(html, "name", "author")
         or find_meta_content(html, "property", "article:author")
         or find_meta_content(html, "name", "weixin:author")
+        or find_meta_content(html, "itemprop", "author")
     )
     published_at = (
         find_meta_content(html, "property", "article:published_time")
         or find_meta_content(html, "name", "publishdate")
         or find_meta_content(html, "name", "pubdate")
+        or find_meta_content(html, "itemprop", "datePublished")
     )
 
     if not text:
@@ -864,6 +880,10 @@ def crawl_article_page(entry):
         "text": text,
         "author": clean_inline(author),
         "publishedAt": clean_inline(published_at),
+        "siteName": clean_inline(site_name),
+        "description": clean_inline(description),
+        "finalUrl": final_url,
+        "rawHtml": html,
         "images": dedupe_images(images),
     }
 
@@ -874,15 +894,50 @@ def select_article_block(html, source_key):
         if block:
             return block
 
-    for pattern in [
-        r"<article\b[^>]*>(.*?)</article>",
-        r"<main\b[^>]*>(.*?)</main>",
-        r"<div\b[^>]*(?:class|id)=[\"'][^\"']*(?:article|content|post|entry|rich_media_content)[^\"']*[\"'][^>]*>(.*?)</div>",
-    ]:
-        match = re.search(pattern, html, re.I | re.S)
-        if match:
-            return match.group(1)
-    return ""
+    candidates = []
+    for tag_name in ["article", "main", "section", "div"]:
+        for block in find_tag_blocks(html, tag_name):
+            attrs = parse_attrs(block[: min(len(block), 1000)])
+            marker = " ".join([attrs.get("id", ""), attrs.get("class", ""), attrs.get("role", "")]).lower()
+            if tag_name in {"article", "main"} or re.search(r"article|content|post|entry|story|rich_media_content|正文|文章", marker):
+                candidates.append(block)
+
+    if not candidates:
+        return ""
+    return max(candidates, key=article_score)
+
+
+def find_tag_blocks(html, tag_name):
+    blocks = []
+    tag_pattern = re.compile(rf"</?{tag_name}\b[^>]*>", re.I)
+    for match in tag_pattern.finditer(html or ""):
+        tag = match.group(0)
+        if tag.startswith("</"):
+            continue
+        start = match.start()
+        depth = 0
+        for tag_match in tag_pattern.finditer(html, match.start()):
+            current = tag_match.group(0)
+            if current.startswith("</"):
+                depth -= 1
+                if depth == 0:
+                    blocks.append(html[start : tag_match.end()])
+                    break
+            else:
+                depth += 1
+    return blocks[:80]
+
+
+def article_score(html):
+    text = html_to_text(html)
+    if len(text) < 80:
+        return 0
+    paragraph_count = len(re.findall(r"</p>|<br\s*/?>", html or "", re.I))
+    link_text = html_to_text(" ".join(match.group(1) for match in re.finditer(r"<a\b[^>]*>(.*?)</a>", html or "", re.I | re.S)))
+    link_penalty = min(len(link_text) / max(len(text), 1), 0.8)
+    punctuation_bonus = len(re.findall(r"[。！？.!?]", text))
+    image_bonus = min(len(re.findall(r"<img\b", html or "", re.I)), 8) * 80
+    return len(text) * (1 - link_penalty) + paragraph_count * 120 + punctuation_bonus * 20 + image_bonus
 
 
 def find_block_by_id(html, element_id):
@@ -1071,14 +1126,30 @@ def extract_images(html, base_url):
 
 
 def html_to_text(html):
-    html = re.sub(r"<script\b.*?</script>", "", html or "", flags=re.I | re.S)
-    html = re.sub(r"<style\b.*?</style>", "", html, flags=re.I | re.S)
-    html = re.sub(r"<noscript\b.*?</noscript>", "", html, flags=re.I | re.S)
+    html = strip_noise_html(html)
     html = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
     html = re.sub(r"</(?:p|div|section|article|li|h[1-6]|blockquote|tr)>", "\n\n", html, flags=re.I)
     html = re.sub(r"<li\b[^>]*>", "- ", html, flags=re.I)
     html = re.sub(r"<[^>]+>", "", html)
     return clean_text(html)
+
+
+def strip_noise_html(html):
+    html = html or ""
+    for tag_name in ["script", "style", "noscript", "svg", "canvas", "iframe", "form", "button"]:
+        html = re.sub(rf"<{tag_name}\b.*?</{tag_name}>", "", html, flags=re.I | re.S)
+    html = re.sub(r"<(?:header|footer|nav|aside)\b.*?</(?:header|footer|nav|aside)>", "", html, flags=re.I | re.S)
+    noise_pattern = (
+        r"(?:comment|comments|reply|related|recommend|promo|advert|ad-|ads|"
+        r"banner|cookie|subscribe|newsletter|share|social|sidebar|menu|nav|footer|header)"
+    )
+    html = re.sub(
+        rf"<([a-z0-9]+)\b[^>]*(?:class|id)=[\"'][^\"']*{noise_pattern}[^\"']*[\"'][^>]*>.*?</\1>",
+        "",
+        html,
+        flags=re.I | re.S,
+    )
+    return html
 
 
 def clean_text(value):

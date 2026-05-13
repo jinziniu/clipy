@@ -301,6 +301,15 @@ async function requestEntryVerification(entry) {
   return response.json();
 }
 
+async function requestEntryReparse(entry) {
+  if (!isDiskStorage()) throw new Error("Reparse requires disk storage");
+  const response = await fetch(`${API_ROOT}/entries/${encodeURIComponent(entry.id)}/reparse`, {
+    method: "POST",
+  });
+  if (!response.ok) throw new Error("Reparse failed");
+  return response.json();
+}
+
 async function requestEntryProfileOpen(entry) {
   if (!isDiskStorage()) throw new Error("Profile open requires disk storage");
   const response = await fetch(`${API_ROOT}/open/${encodeURIComponent(entry.id)}`, {
@@ -1547,6 +1556,20 @@ function renderTimelineItem(entry) {
     actions.prepend(verifyButton);
   }
 
+  if (shouldShowReparseAction(entry, knowledgeStatus)) {
+    const reparseButton = document.createElement("button");
+    reparseButton.className = "entry-action entry-verify";
+    reparseButton.type = "button";
+    reparseButton.textContent = "重新解析";
+    reparseButton.title = "重新抓取并解析正文";
+    reparseButton.setAttribute("aria-label", "重新抓取并解析正文");
+    reparseButton.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      await reparseEntry(entry);
+    });
+    actions.prepend(reparseButton);
+  }
+
   if (entry.kind === "file-batch") {
     renderFileBatchDetails(entryDetails, entry);
     article.setAttribute("aria-expanded", String(state.expandedEntries.has(entry.id)));
@@ -1618,8 +1641,27 @@ function shouldShowVerifyAction(entry, knowledgeStatus) {
   );
 }
 
+function shouldShowReparseAction(entry, knowledgeStatus) {
+  return isDiskStorage() && entry.kind === "link" && knowledgeStatus.kind === "failed";
+}
+
 function getVerifyButtonLabel(knowledgeStatus) {
   return "打开补全";
+}
+
+async function reparseEntry(entry) {
+  try {
+    const payload = await requestEntryReparse(entry);
+    if (payload.entry) {
+      state.entries = sortEntries(state.entries.map((item) => (item.id === entry.id ? payload.entry : item)));
+    }
+    showNotice("已重新解析。");
+    render();
+    scheduleDiskRefresh();
+  } catch (error) {
+    console.error(error);
+    showNotice("重新解析失败。", true);
+  }
 }
 
 async function verifyEntry(entry) {
@@ -2217,12 +2259,21 @@ function getMetaText(entry) {
 
 function getKnowledgeStatus(entry, sourceKey = getEntrySourceKey(entry)) {
   const processingStatus = entry.processingStatus || "";
+  const processingStep = entry.processingStep || "";
   const contentStatus = entry.content?.status || "";
   const itemStatus = entry.item?.status || "";
   const verificationStatus = entry.verification?.status || "";
 
-  if (processingStatus === "processing" || processingStatus === "uploading") {
-    return { kind: "processing", label: entry.kind === "link" ? "读取中" : "解析中" };
+  if (["queued", "processing", "fetching", "parsing", "archiving", "uploading"].includes(processingStatus)) {
+    const labels = {
+      queued: "排队中",
+      processing: entry.kind === "link" ? "读取中" : "解析中",
+      fetching: "抓取中",
+      parsing: "解析中",
+      archiving: "归档中",
+      uploading: "上传中",
+    };
+    return { kind: "processing", label: labels[processingStatus] || labels[processingStep] || "处理中" };
   }
 
   if (entry.kind === "link" && contentStatus === "ready" && isFallbackTitle(entry, sourceKey)) {

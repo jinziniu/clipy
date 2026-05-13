@@ -43,11 +43,21 @@ VERIFICATION_POLL_SECONDS = 3
 PROFILE_OPEN_REFRESH_DELAYS = [3, 10, 25, 60, 120]
 
 sys.path.insert(0, str(ROOT / "clerk"))
-from clerk_app.agent import answer as clerk_answer, list_articles as clerk_list_articles, search as clerk_search, source_index as clerk_source_index
-from clerk_app.chats import append_message as clerk_append_message, create_session as clerk_create_session, list_sessions as clerk_list_sessions, read_session as clerk_read_session
-from clerk_app.config import DEFAULT_BASE_URL as CLERK_DEFAULT_BASE_URL, DEFAULT_MODEL as CLERK_DEFAULT_MODEL, llm_config as clerk_llm_config
-from clerk_app.server import HTML as CLERK_HTML, WIKI_HTML as CLERK_WIKI_HTML
-from clerk_app.wiki import ingest_incremental as clerk_ingest_incremental, read_main_wiki as clerk_read_main_wiki, wiki_status as clerk_wiki_status
+CLERK_AVAILABLE = True
+CLERK_IMPORT_ERROR = ""
+try:
+    from clerk_app.agent import answer as clerk_answer, list_articles as clerk_list_articles, search as clerk_search, source_index as clerk_source_index
+    from clerk_app.chats import append_message as clerk_append_message, create_session as clerk_create_session, list_sessions as clerk_list_sessions, read_session as clerk_read_session
+    from clerk_app.config import DEFAULT_BASE_URL as CLERK_DEFAULT_BASE_URL, DEFAULT_MODEL as CLERK_DEFAULT_MODEL, llm_config as clerk_llm_config
+    from clerk_app.server import HTML as CLERK_HTML, WIKI_HTML as CLERK_WIKI_HTML
+    from clerk_app.wiki import ingest_incremental as clerk_ingest_incremental, read_main_wiki as clerk_read_main_wiki, wiki_status as clerk_wiki_status
+except Exception as error:
+    CLERK_AVAILABLE = False
+    CLERK_IMPORT_ERROR = str(error)
+    CLERK_DEFAULT_BASE_URL = ""
+    CLERK_DEFAULT_MODEL = ""
+    CLERK_HTML = ""
+    CLERK_WIKI_HTML = ""
 
 SOURCE_NAMES = {
     "xhs": "小红书",
@@ -241,6 +251,69 @@ def remove_entry_from_repositories(entry_id):
         changed = True
     if changed:
         write_repositories(next_repositories)
+
+
+def search_entries(query, limit=30):
+    query = clean_search_query(query)
+    if not query:
+        return []
+
+    terms = [term for term in re.split(r"\s+", query.lower()) if term]
+    results = []
+    for entry in read_entries(enrich_links=False):
+        haystack_parts = [
+            entry.get("title") or "",
+            entry.get("url") or "",
+            entry.get("sourceName") or "",
+            entry.get("sourceKey") or "",
+            " ".join(entry.get("tags") or []) if isinstance(entry.get("tags"), list) else "",
+        ]
+        content_text = read_entry_search_text(entry)
+        haystack = clean_inline_text(" ".join(haystack_parts + [content_text])).lower()
+        if not all(term in haystack for term in terms):
+            continue
+        results.append(
+            {
+                "entry": entry,
+                "snippet": build_search_snippet(content_text or entry.get("url") or entry.get("title") or "", terms),
+            }
+        )
+        if len(results) >= limit:
+            break
+    return results
+
+
+def clean_search_query(query):
+    return clean_inline_text(str(query or ""))[:120]
+
+
+def read_entry_search_text(entry):
+    content_path = ((entry.get("item") or {}).get("contentPath") or (entry.get("content") or {}).get("markdownPath") or "")
+    if not content_path:
+        return ""
+    path = (DATA_DIR / content_path).resolve()
+    try:
+        data_root = DATA_DIR.resolve()
+        if data_root not in path.parents or not path.exists() or path.stat().st_size > MAX_METADATA_BYTES:
+            return ""
+        return path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def build_search_snippet(text, terms, max_length=180):
+    text = clean_inline_text(text)
+    if not text:
+        return ""
+    lower_text = text.lower()
+    positions = [lower_text.find(term) for term in terms if lower_text.find(term) >= 0]
+    start = max(min(positions) - 60, 0) if positions else 0
+    snippet = text[start : start + max_length].strip()
+    if start > 0:
+        snippet = f"...{snippet}"
+    if start + max_length < len(text):
+        snippet = f"{snippet}..."
+    return snippet
 
 
 def read_browser_session_state():
@@ -1682,23 +1755,46 @@ def enrich_existing_links(entries):
     return enriched_entries
 
 
-def start_background_entry_processing(entry):
-    worker = threading.Thread(target=process_entry_in_background, args=(dict(entry),), daemon=True)
+def start_background_entry_processing(entry, force_refresh=False):
+    worker = threading.Thread(target=process_entry_in_background, args=(dict(entry), force_refresh), daemon=True)
     worker.start()
 
 
-def process_entry_in_background(entry):
+def mark_entry_processing(entry, status, step="", error=""):
+    updated = dict(entry)
+    updated["processingStatus"] = status
+    if step:
+        updated["processingStep"] = step
+    else:
+        updated.pop("processingStep", None)
+    if error:
+        updated["processingError"] = error[:200]
+    else:
+        updated.pop("processingError", None)
+    upsert_entry(updated)
+    return updated
+
+
+def process_entry_in_background(entry, force_refresh=False):
     updated = dict(entry)
     try:
         if updated.get("kind") == "link":
-            updated = process_link_with_browser_profile(updated)
+            updated = mark_entry_processing(updated, "fetching", "fetching")
+            updated = process_link_with_browser_profile(updated, force_refresh=force_refresh)
+            updated = mark_entry_processing(updated, "parsing", "parsing")
+        else:
+            updated = mark_entry_processing(updated, "parsing", "parsing")
 
-        updated.pop("processingError", None)
-        updated["processingStatus"] = "ready"
+        updated = mark_entry_processing(updated, "archiving", "archiving")
         updated = build_item_for_entry(updated, DATA_DIR)
+        updated.pop("processingError", None)
+        updated.pop("processingStep", None)
+        updated["processingStatus"] = "ready"
+        updated["processedAt"] = int(time.time() * 1000)
         upsert_entry(updated)
     except Exception as error:
         updated["processingStatus"] = "failed"
+        updated.pop("processingStep", None)
         updated["processingError"] = str(error)[:200]
         try:
             updated = build_item_for_entry(updated, DATA_DIR)
@@ -2067,8 +2163,27 @@ class ClipyHandler(SimpleHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Clipy-Id, X-Clipy-File-Id, X-File-Name, X-File-Type")
         self.end_headers()
 
+    def handle_clerk_unavailable(self, path):
+        message = "Clerk module unavailable. Add `clerk/clerk_app` to enable /clerk features."
+        if path.startswith("/clerk/api/"):
+            json_response(
+                self,
+                {
+                    "error": "clerk unavailable",
+                    "message": message,
+                    "importError": CLERK_IMPORT_ERROR,
+                },
+                503,
+            )
+            return
+        html_response(self, f"<h1>Clerk unavailable</h1><p>{message}</p>", 503)
+
     def do_GET(self):
         path = urlparse(self.path).path
+        if path.startswith("/clerk") and not CLERK_AVAILABLE:
+            self.handle_clerk_unavailable(path)
+            return
+
         if path in {"/clerk", "/clerk/"}:
             html_response(self, CLERK_HTML)
             return
@@ -2126,6 +2241,11 @@ class ClipyHandler(SimpleHTTPRequestHandler):
             json_response(self, {"repositories": read_repositories()})
             return
 
+        if path == "/api/search":
+            query = parse_qs(urlparse(self.path).query).get("q", [""])[0]
+            json_response(self, {"query": clean_search_query(query), "results": search_entries(query)})
+            return
+
         if path == "/api/browser-sessions":
             json_response(self, {"sessions": list_browser_sessions()})
             return
@@ -2142,6 +2262,10 @@ class ClipyHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if path.startswith("/clerk") and not CLERK_AVAILABLE:
+            self.handle_clerk_unavailable(path)
+            return
+
         if path == "/clerk/api/sessions":
             json_response(self, {"session": clerk_create_session()})
             return
@@ -2205,6 +2329,11 @@ class ClipyHandler(SimpleHTTPRequestHandler):
             self.verify_entry(unquote(verify_match.group(1)))
             return
 
+        reparse_match = re.fullmatch(r"/api/entries/([^/]+)/reparse", path)
+        if reparse_match:
+            self.reparse_entry(unquote(reparse_match.group(1)))
+            return
+
         if path.startswith("/api/open/"):
             self.open_entry(path.removeprefix("/api/open/"))
             return
@@ -2261,8 +2390,10 @@ class ClipyHandler(SimpleHTTPRequestHandler):
             return
 
         entry.setdefault("createdAt", int(time.time() * 1000))
-        entry = prepare_link_entry_for_initial_save(entry)
-        entry["processingStatus"] = "processing"
+        entry = normalize_entry_source(entry)
+        entry["processingStatus"] = "queued"
+        entry["processingStep"] = "queued"
+        entry.pop("processingError", None)
         upsert_entry(entry)
         start_background_entry_processing(entry)
         json_response(self, {"entry": entry})
@@ -2311,6 +2442,20 @@ class ClipyHandler(SimpleHTTPRequestHandler):
     def verify_entry(self, entry_id):
         _entry, payload, status = request_entry_verification(entry_id)
         json_response(self, payload, status)
+
+    def reparse_entry(self, entry_id):
+        entry = next((item for item in read_entries(enrich_links=False) if item.get("id") == entry_id), None)
+        if not entry:
+            json_response(self, {"error": "Entry not found"}, 404)
+            return
+
+        entry = dict(entry)
+        entry["processingStatus"] = "queued"
+        entry["processingStep"] = "queued"
+        entry.pop("processingError", None)
+        upsert_entry(entry)
+        start_background_entry_processing(entry, force_refresh=True)
+        json_response(self, {"entry": entry})
 
     def open_profile_entry(self, entry_id):
         _entry, payload, status = request_entry_profile_open(entry_id)
