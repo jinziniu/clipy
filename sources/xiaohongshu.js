@@ -14,9 +14,10 @@ export const xiaohongshuSource = {
   match({ host }) {
     return host.includes("xiaohongshu.com") || host.includes("xhslink.com");
   },
-  buildTitle({ sharedTitle, lastPart }) {
+  buildTitle({ sharedTitle, metadataTitle }) {
+    if (metadataTitle) return metadataTitle;
     if (sharedTitle) return sharedTitle;
-    return lastPart ? `小红书笔记 ${shorten(lastPart, 18)}` : "小红书收藏";
+    return "小红书收藏";
   },
   async crawl() {
     return { status: "not_implemented", source: "xhs" };

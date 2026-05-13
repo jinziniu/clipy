@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-from html import unescape
+from html import escape, unescape
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 from urllib.request import Request, urlopen
 from browser_profile import fetch_with_browser_profile, open_visible_browser_profile, summarize_browser_result
 from content_pipeline import capture_browser_result_for_entry, capture_markdown_for_entry
-from item_pipeline import build_item_for_entry, remove_entry_item, write_items_index
+from item_pipeline import build_item_for_entry, markdown_to_html_document, remove_entry_item, write_items_index
 import gzip
 import hashlib
 import json
 import mimetypes
+import os
 import re
 import shutil
 import sqlite3
@@ -38,9 +40,13 @@ VERIFICATION_LOCK = threading.RLock()
 VERIFICATION_WORKERS = set()
 PROFILE_OPEN_LOCK = threading.RLock()
 PROFILE_OPEN_WORKERS = set()
+AI_SUMMARY_LOCK = threading.RLock()
+AI_SUMMARY_WORKERS = set()
 VERIFICATION_TIMEOUT_MS = 5 * 60 * 1000
 VERIFICATION_POLL_SECONDS = 3
 PROFILE_OPEN_REFRESH_DELAYS = [3, 10, 25, 60, 120]
+AI_SUMMARY_MAX_CHARS = 16000
+AI_SUMMARY_TIMEOUT = 45
 
 sys.path.insert(0, str(ROOT / "clerk"))
 CLERK_AVAILABLE = True
@@ -296,9 +302,20 @@ def read_entry_search_text(entry):
         data_root = DATA_DIR.resolve()
         if data_root not in path.parents or not path.exists() or path.stat().st_size > MAX_METADATA_BYTES:
             return ""
-        return path.read_text(encoding="utf-8", errors="replace")
+        return strip_markdown_front_matter(path.read_text(encoding="utf-8", errors="replace"))
     except Exception:
         return ""
+
+
+def strip_markdown_front_matter(text):
+    text = re.sub(r"^---\s*\n.*?\n---\s*\n", "", text or "", count=1, flags=re.S)
+    body_match = re.search(r"(^|\n)##\s+正文\s*\n+(.*)", text, re.S)
+    if body_match:
+        text = body_match.group(2)
+    text = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.M)
+    return text
 
 
 def build_search_snippet(text, terms, max_length=180):
@@ -316,6 +333,170 @@ def build_search_snippet(text, terms, max_length=180):
     return snippet
 
 
+def start_background_ai_summary(entry):
+    if not ai_config().get("configured"):
+        return False
+    entry_id = entry.get("id")
+    if not entry_id or (entry.get("item") or {}).get("status") != "ready":
+        return False
+    with AI_SUMMARY_LOCK:
+        if entry_id in AI_SUMMARY_WORKERS:
+            return False
+        AI_SUMMARY_WORKERS.add(entry_id)
+    worker = threading.Thread(target=ai_summary_worker, args=(entry_id,), daemon=True)
+    worker.start()
+    return True
+
+
+def request_entry_ai_summary(entry_id):
+    entry = next((item for item in read_entries(enrich_links=False) if item.get("id") == entry_id), None)
+    if not entry:
+        return None, {"error": "Entry not found"}, 404
+    if not ai_config().get("configured"):
+        if (entry.get("aiStatus") or (entry.get("ai") or {}).get("status")) == "summarizing":
+            entry = mark_entry_ai_status(entry, "failed", "AI is not configured")
+        return entry, {"error": "AI is not configured", "config": public_ai_config()}, 503
+    if (entry.get("item") or {}).get("status") != "ready":
+        return entry, {"error": "Entry content is not ready", "entry": entry}, 409
+
+    entry = mark_entry_ai_status(entry, "summarizing")
+    start_background_ai_summary(entry)
+    return entry, {"entry": entry}, 202
+
+
+def public_ai_config():
+    config = ai_config()
+    return {
+        "configured": config.get("configured"),
+        "baseUrl": config.get("base_url"),
+        "model": config.get("model"),
+    }
+
+
+def mark_entry_ai_status(entry, status, error=""):
+    updated = dict(entry)
+    updated["aiStatus"] = status
+    ai = dict(updated.get("ai") or {})
+    ai["status"] = status
+    ai["updatedAt"] = int(time.time() * 1000)
+    if error:
+        ai["error"] = error[:200]
+    else:
+        ai.pop("error", None)
+    updated["ai"] = ai
+    upsert_entry(updated)
+    return updated
+
+
+def ai_summary_worker(entry_id):
+    try:
+        entry = next((item for item in read_entries(enrich_links=False) if item.get("id") == entry_id), None)
+        if not entry:
+            return
+        entry = mark_entry_ai_status(entry, "summarizing")
+        content = read_entry_search_text(entry)
+        if not content:
+            mark_entry_ai_status(entry, "failed", "没有可总结的正文内容")
+            return
+
+        result = generate_ai_summary(entry, content[:AI_SUMMARY_MAX_CHARS])
+        latest = next((item for item in read_entries(enrich_links=False) if item.get("id") == entry_id), entry)
+        updated = dict(latest)
+        updated["aiStatus"] = "ready"
+        updated["ai"] = {
+            "status": "ready",
+            "summary": clean_inline_text(result.get("summary") or ""),
+            "keyPoints": clean_string_list(result.get("keyPoints")),
+            "suggestedTags": clean_string_list(result.get("suggestedTags")),
+            "model": result.get("model") or ai_config().get("model"),
+            "updatedAt": int(time.time() * 1000),
+        }
+        upsert_entry(updated)
+    except Exception as error:
+        entry = next((item for item in read_entries(enrich_links=False) if item.get("id") == entry_id), {"id": entry_id})
+        mark_entry_ai_status(entry, "failed", str(error))
+    finally:
+        with AI_SUMMARY_LOCK:
+            AI_SUMMARY_WORKERS.discard(entry_id)
+
+
+def generate_ai_summary(entry, content):
+    config = ai_config()
+    prompt = {
+        "title": entry.get("title") or "",
+        "url": entry.get("url") or "",
+        "content": content,
+    }
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是 Clipy 的阅读助手。请只输出 JSON，不要输出 Markdown。"
+                "字段必须是 summary、keyPoints、suggestedTags。summary 用中文一句话。"
+                "keyPoints 是 3 到 6 条中文要点，suggestedTags 是 3 到 6 个短标签。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(prompt, ensure_ascii=False),
+        },
+    ]
+    payload = {
+        "model": config["model"],
+        "messages": messages,
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"},
+    }
+    response = post_ai_chat_completion(config, payload)
+    content_text = (((response.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+    parsed = parse_json_object(content_text)
+    parsed["model"] = response.get("model") or config["model"]
+    return parsed
+
+
+def post_ai_chat_completion(config, payload):
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = Request(
+        f"{config['base_url']}/chat/completions",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {config['api_key']}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=AI_SUMMARY_TIMEOUT) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"AI request failed: HTTP {error.code} {body[:160]}") from error
+
+
+def parse_json_object(text):
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text or "", re.S)
+        if not match:
+            raise
+        data = json.loads(match.group(0))
+    return data if isinstance(data, dict) else {}
+
+
+def clean_string_list(values):
+    if not isinstance(values, list):
+        return []
+    clean = []
+    seen = set()
+    for value in values:
+        text = clean_inline_text(str(value or ""))[:60]
+        if text and text not in seen:
+            clean.append(text)
+            seen.add(text)
+    return clean[:8]
+
+
 def read_browser_session_state():
     ensure_storage()
     try:
@@ -330,6 +511,36 @@ def write_browser_session_state(state):
     temp_file = BROWSER_SESSIONS_FILE.with_suffix(".tmp")
     temp_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     temp_file.replace(BROWSER_SESSIONS_FILE)
+
+
+def load_local_env():
+    env_path = ROOT / ".env"
+    if not env_path.exists():
+        return
+    try:
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except Exception:
+        pass
+
+
+def ai_config():
+    api_key = os.environ.get("CLIPY_AI_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
+    base_url = os.environ.get("CLIPY_AI_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
+    model = os.environ.get("CLIPY_AI_MODEL") or os.environ.get("OPENAI_MODEL") or "gpt-4o-mini"
+    return {
+        "configured": bool(api_key),
+        "api_key": api_key,
+        "base_url": base_url.rstrip("/"),
+        "model": model,
+    }
 
 
 def upsert_entry(entry):
@@ -1017,6 +1228,79 @@ def binary_response(handler, body, content_type, status=200):
     handler.wfile.write(body)
 
 
+def reader_html_from_markdown(entry, markdown):
+    title = escape(sanitize_title(entry.get("title") or "Clipy 阅读"))
+    body = strip_markdown_front_matter(markdown)
+    body = re.sub(r"&", "&amp;", body)
+    body = re.sub(r"<", "&lt;", body)
+    body = re.sub(r">", "&gt;", body)
+    paragraphs = "".join(f"<p>{line}</p>" for line in body.splitlines() if line.strip())
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <style>
+    body {{ margin: 0; background: #f7f4ef; color: #1e2528; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; }}
+    main {{ max-width: 780px; margin: 0 auto; padding: 40px 24px 72px; background: #fffdf9; min-height: 100vh; }}
+    h1 {{ line-height: 1.25; }}
+    p {{ line-height: 1.75; white-space: pre-wrap; }}
+  </style>
+</head>
+<body><main><h1>{title}</h1>{paragraphs}</main></body>
+</html>"""
+
+
+def inject_reader_ai_summary(entry, html):
+    ai = entry.get("ai") or {}
+    ai_status = entry.get("aiStatus") or ai.get("status") or ""
+    summary = clean_inline_text(ai.get("summary") or "")
+    key_points = clean_string_list(ai.get("keyPoints") or [])
+    suggested_tags = clean_string_list(ai.get("suggestedTags") or [])
+    if ai_status != "ready" and not summary and not key_points and not suggested_tags:
+        if ai_status != "summarizing":
+            return html
+        block = """
+<section class="reader-ai reader-ai-pending">
+  <h2>AI 摘要</h2>
+  <p>AI 正在总结。</p>
+</section>
+"""
+    else:
+        parts = ['<section class="reader-ai">', "<h2>AI 摘要</h2>"]
+        if summary:
+            parts.append(f"<p>{escape(summary)}</p>")
+        if key_points:
+            parts.append("<ul>")
+            parts.extend(f"<li>{escape(point)}</li>" for point in key_points)
+            parts.append("</ul>")
+        if suggested_tags:
+            tags = "".join(f"<span>{escape(tag)}</span>" for tag in suggested_tags)
+            parts.append(f'<div class="reader-ai-tags">{tags}</div>')
+        parts.append("</section>")
+        block = "\n".join(parts)
+
+    styles = """
+    .reader-ai { margin: 24px 0 32px; padding: 18px 20px; border: 1px solid #cfe2dc; border-radius: 8px; background: #f4fbf8; color: #173f3d; }
+    .reader-ai h2 { margin: 0 0 10px; font-size: 18px; }
+    .reader-ai p { margin: 0 0 10px; }
+    .reader-ai ul { margin: 10px 0 0; padding-left: 1.25rem; }
+    .reader-ai-tags { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    .reader-ai-tags span { padding: 4px 8px; border-radius: 999px; background: #dcefeb; font-size: 13px; }
+"""
+    if ".reader-ai" not in html:
+        html = html.replace("  </style>", styles + "  </style>", 1)
+    return html.replace("<main>", f"<main>\n{block}", 1)
+
+
+def rewrite_reader_asset_links(entry_id, html):
+    prefix = f"/api/reader-assets/{quote(entry_id)}/"
+    html = re.sub(r'(<img\b[^>]*\bsrc=")assets/([^"]+)"', lambda match: f"{match.group(1)}{prefix}{quote(match.group(2))}\"", html)
+    html = re.sub(r"(<img\b[^>]*\bsrc=')assets/([^']+)'", lambda match: f"{match.group(1)}{prefix}{quote(match.group(2))}'", html)
+    return html
+
+
 def open_with_system(target):
     if sys.platform == "darwin":
         command = ["open", str(target)]
@@ -1616,6 +1900,7 @@ def clean_page_title(title, url):
         " | WeChat Official Account",
         " / X",
         " on X",
+        " - 知乎",
         "的微博_微博",
     ]
     for suffix in suffixes:
@@ -1661,6 +1946,8 @@ def is_generic_saved_title(entry):
         "网页",
     }
     if title in generic_titles:
+        return True
+    if source == "zhihu" and re.fullmatch(r"知乎(问题|文章)\s+\d+", title):
         return True
     if source == "x" and re.fullmatch(r"@[\w.-]+\s+的帖子", title):
         return True
@@ -1792,6 +2079,7 @@ def process_entry_in_background(entry, force_refresh=False):
         updated["processingStatus"] = "ready"
         updated["processedAt"] = int(time.time() * 1000)
         upsert_entry(updated)
+        start_background_ai_summary(updated)
     except Exception as error:
         updated["processingStatus"] = "failed"
         updated.pop("processingStep", None)
@@ -2246,12 +2534,24 @@ class ClipyHandler(SimpleHTTPRequestHandler):
             json_response(self, {"query": clean_search_query(query), "results": search_entries(query)})
             return
 
+        if path == "/api/ai/status":
+            json_response(self, public_ai_config())
+            return
+
         if path == "/api/browser-sessions":
             json_response(self, {"sessions": list_browser_sessions()})
             return
 
         if path == "/api/logo":
             self.serve_logo(parse_qs(urlparse(self.path).query).get("url", [""])[0])
+            return
+
+        if path.startswith("/api/reader-assets/"):
+            self.serve_reader_asset(path.removeprefix("/api/reader-assets/"))
+            return
+
+        if path.startswith("/api/reader/"):
+            self.serve_reader(path.removeprefix("/api/reader/"))
             return
 
         if path.startswith("/api/files/"):
@@ -2332,6 +2632,11 @@ class ClipyHandler(SimpleHTTPRequestHandler):
         reparse_match = re.fullmatch(r"/api/entries/([^/]+)/reparse", path)
         if reparse_match:
             self.reparse_entry(unquote(reparse_match.group(1)))
+            return
+
+        summarize_match = re.fullmatch(r"/api/entries/([^/]+)/summarize", path)
+        if summarize_match:
+            self.summarize_entry(unquote(summarize_match.group(1)))
             return
 
         if path.startswith("/api/open/"):
@@ -2456,6 +2761,10 @@ class ClipyHandler(SimpleHTTPRequestHandler):
         upsert_entry(entry)
         start_background_entry_processing(entry, force_refresh=True)
         json_response(self, {"entry": entry})
+
+    def summarize_entry(self, entry_id):
+        _entry, payload, status = request_entry_ai_summary(entry_id)
+        json_response(self, payload, status)
 
     def open_profile_entry(self, entry_id):
         _entry, payload, status = request_entry_profile_open(entry_id)
@@ -2605,6 +2914,40 @@ class ClipyHandler(SimpleHTTPRequestHandler):
         with file_path.open("rb") as file:
             shutil.copyfileobj(file, self.wfile)
 
+    def serve_reader(self, raw_id):
+        entry_id = unquote(raw_id)
+        entry = next((item for item in read_entries(enrich_links=False) if item.get("id") == entry_id), None)
+        if not entry:
+            text_response(self, "Reader not found", 404)
+            return
+
+        item = entry.get("item") or {}
+        content_path = (DATA_DIR / (item.get("contentPath") or "")).resolve()
+        data_root = DATA_DIR.resolve()
+
+        if content_path.exists() and content_path.is_file() and data_root in content_path.parents:
+            html = markdown_to_html_document(entry, content_path.read_text(encoding="utf-8", errors="replace"))
+            html = inject_reader_ai_summary(entry, html)
+            html = rewrite_reader_asset_links(entry_id, html)
+            html_response(self, html)
+            return
+
+        text_response(self, "Reader content not ready", 404)
+
+    def serve_reader_asset(self, raw_path):
+        parts = raw_path.split("/", 1)
+        if len(parts) != 2:
+            text_response(self, "Asset not found", 404)
+            return
+        entry_id = safe_filename(unquote(parts[0]))
+        asset_name = safe_filename(unquote(parts[1]))
+        asset_path = (ITEMS_DIR / entry_id / "assets" / asset_name).resolve()
+        if not asset_path.exists() or not asset_path.is_file() or ITEMS_DIR.resolve() not in asset_path.parents:
+            text_response(self, "Asset not found", 404)
+            return
+        content_type = mimetypes.guess_type(asset_path.name)[0] or "application/octet-stream"
+        binary_response(self, asset_path.read_bytes(), content_type)
+
     def serve_logo(self, raw_url):
         if not raw_url:
             text_response(self, "Logo not found", 404)
@@ -2620,6 +2963,7 @@ class ClipyHandler(SimpleHTTPRequestHandler):
 
 
 def main():
+    load_local_env()
     ensure_storage()
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 4173
     server = ThreadingHTTPServer(("127.0.0.1", port), ClipyHandler)

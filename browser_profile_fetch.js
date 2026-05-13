@@ -88,6 +88,8 @@ async function ensureChrome() {
     throw new Error("Chrome not found. Set CHROME_PATH to the Chrome executable.");
   }
 
+  removeStaleSingletonFiles(profileDir);
+
   const args = [
     `--remote-debugging-port=${port}`,
     `--user-data-dir=${profileDir}`,
@@ -111,6 +113,18 @@ async function ensureChrome() {
     await delay(250);
   }
   throw new Error("Chrome DevTools did not start");
+}
+
+function removeStaleSingletonFiles(profilePath) {
+  for (const name of ["SingletonLock", "SingletonSocket", "SingletonCookie"]) {
+    try {
+      const target = path.join(profilePath, name);
+      fs.lstatSync(target);
+      fs.rmSync(target, { force: true });
+    } catch {
+      // Best effort only. Chrome can still report a clearer startup failure.
+    }
+  }
 }
 
 function findChromePath() {
@@ -218,6 +232,15 @@ async function evaluatePage(client) {
       "#readme .markdown-body",
       "article.markdown-body",
       ".markdown-body",
+      ".QuestionHeader-title",
+      ".QuestionRichText",
+      ".QuestionAnswer-content",
+      ".AnswerItem .RichContent-inner",
+      ".AnswerItem .RichText",
+      ".Post-RichText",
+      ".ContentItem",
+      ".RichContent-inner",
+      ".RichText",
       "article",
       "main",
       "[role='main']",
@@ -354,6 +377,10 @@ class CdpClient {
 
   connect() {
     return new Promise((resolve, reject) => {
+      if (!globalThis.WebSocket) {
+        reject(new Error("WebSocket is not available in this Node.js runtime"));
+        return;
+      }
       this.ws = new WebSocket(this.wsUrl);
       this.ws.onopen = () => resolve();
       this.ws.onerror = () => reject(new Error("WebSocket connection failed"));

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Clipy 收藏夹</title>
     <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="./styles.css?v=20260512-repository-name-hitbox" />
+    <link rel="stylesheet" href="./styles.css?v=20260513-ai-reader-refresh" />
   </head>
   <body>
     <main class="app-shell">
@@ -64,6 +64,15 @@
           </div>
         </div>
         <p id="notice" class="notice" role="status"></p>
+      </section>
+
+      <section class="search-bar" aria-label="搜索收藏">
+        <input id="searchInput" type="search" placeholder="搜索标题、正文、标签" aria-label="搜索收藏" autocomplete="off" />
+        <button id="searchClearButton" class="icon-button search-clear hidden" type="button" aria-label="清空搜索" title="清空搜索">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M18 6 6 18M6 6l12 12" />
+          </svg>
+        </button>
       </section>
 
       <nav class="filters" aria-label="收藏筛选和仓库">
@@ -165,6 +174,6 @@
       </li>
     </template>
 
-    <script type="module" src="./app.js?v=20260512-repository-name-hitbox"></script>
+    <script type="module" src="./app.js?v=20260513-ai-reader-refresh"></script>
   </body>
 </html>

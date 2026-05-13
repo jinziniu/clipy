@@ -56,7 +56,7 @@ def fetch_with_browser_profile(
 
     try:
         result = subprocess.run(
-            ["node", str(BROWSER_SCRIPT), url, str(profile_dir)],
+            ["node", "--experimental-websocket", str(BROWSER_SCRIPT), url, str(profile_dir)],
             cwd=str(ROOT),
             text=True,
             capture_output=True,

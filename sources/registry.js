@@ -64,9 +64,14 @@ export function getEntryTitle(entry, sourceKey = getEntrySourceKey(entry)) {
     return fileSource.buildTitle({ entry });
   }
 
+  if (sourceKey === "xhs") {
+    const contentTitle = titleFromContent(entry.content?.description || entry.ai?.summary || "");
+    if (isGenericTitle(entry.title || "", sourceKey) && contentTitle) return contentTitle;
+  }
+
   if (entry.kind === "link" && entry.url) {
     try {
-      const metadataTitle = isGenericTitle(entry.title, sourceKey) ? "" : entry.title;
+      const metadataTitle = bestMetadataTitle(entry, sourceKey);
       return getLinkTitle(entry.rawText || entry.url, new URL(entry.url), sourceKey, metadataTitle);
     } catch {
       return entry.title || "未命名收藏";
@@ -112,7 +117,26 @@ function isGenericTitle(title = "", sourceKey = "") {
   ]);
 
   if (genericTitles.has(trimmed)) return true;
+  if (sourceKey === "xhs" && /^小红书笔记\s+[0-9a-f.]+$/i.test(trimmed)) return true;
+  if (sourceKey === "zhihu" && /^知乎(问题|文章)\s+\d+$/.test(trimmed)) return true;
   if (sourceKey === "weibo" && /^微博\s+\d+$/.test(trimmed)) return true;
   if (/^[a-z0-9.-]+\s\/\s/i.test(trimmed)) return true;
   return false;
+}
+
+function bestMetadataTitle(entry, sourceKey) {
+  const candidates = [entry.title, entry.metadataTitle, entry.browserCapture?.title, entry.browserCapture?.documentTitle];
+  return candidates.find((title) => title && !isGenericTitle(title, sourceKey)) || "";
+}
+
+function titleFromContent(value = "") {
+  const text = value
+    .replace(/https?:\/\/\S+/g, "")
+    .replace(/#\S+/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) return "";
+  const sentence = text.split(/[。！？!?]/)[0].trim() || text;
+  const title = sentence.replace(/\s*[-_]\s*小红书\s*$/, "").trim();
+  return title.length > 46 ? `${title.slice(0, 46)}…` : title;
 }

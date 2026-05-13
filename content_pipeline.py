@@ -37,6 +37,7 @@ def capture_markdown_for_entry(entry, data_dir, force=False):
 
     try:
         result = normalize_result(crawl_entry(entry), entry)
+        result = enrich_result_from_existing_snapshot(entry, result, data_dir)
         apply_result_title(entry, result)
         access_requirement = detect_content_access_requirement(entry, result)
         if access_requirement:
@@ -87,6 +88,35 @@ def capture_markdown_for_entry(entry, data_dir, force=False):
             "capturedAt": now_ms(),
         }
     return entry
+
+
+def enrich_result_from_existing_snapshot(entry, result, data_dir):
+    if (entry.get("sourceKey") or "") != "xhs":
+        return result
+    if result.get("title") and not is_generic_xhs_title(result.get("title")):
+        return result
+
+    html_path = (entry.get("content") or {}).get("htmlPath") or ""
+    if not html_path:
+        return result
+    path = (Path(data_dir) / html_path).resolve()
+    try:
+        data_root = Path(data_dir).resolve()
+        if data_root not in path.parents or not path.exists():
+            return result
+        snapshot_data = extract_xhs_page_data(path.read_text(encoding="utf-8", errors="replace"), entry.get("url") or "")
+    except Exception:
+        return result
+
+    if snapshot_data.get("title"):
+        result["title"] = snapshot_data["title"]
+    if snapshot_data.get("description"):
+        result["description"] = snapshot_data["description"]
+    if snapshot_data.get("text") and len(snapshot_data["text"]) > len(result.get("text") or ""):
+        result["text"] = snapshot_data["text"]
+    if snapshot_data.get("images"):
+        result["images"] = dedupe_images(snapshot_data["images"] + (result.get("images") or []))
+    return result
 
 
 def capture_browser_result_for_entry(entry, data_dir, browser_result):
@@ -141,6 +171,8 @@ def capture_browser_result_for_entry(entry, data_dir, browser_result):
         return entry
 
     text = clean_text(browser_result.get("text") or "")
+    if (entry.get("sourceKey") or "") == "zhihu":
+        text = clean_zhihu_page_noise(text)
     images = browser_result.get("images") or []
     if not text and not images:
         html_path = write_browser_html_snapshot(entry, browser_result, data_dir)
@@ -217,6 +249,11 @@ def write_html_snapshot(entry, html, data_dir):
     snapshots_dir = data_dir / BROWSER_SNAPSHOTS_DIR
     snapshots_dir.mkdir(parents=True, exist_ok=True)
     path = snapshots_dir / f"{entry['id']}.html"
+    if (entry.get("sourceKey") or "") == "xhs" and path.exists():
+        new_title = extract_xhs_page_data(html, entry.get("url") or "").get("title") or ""
+        old_title = extract_xhs_page_data(path.read_text(encoding="utf-8", errors="replace"), entry.get("url") or "").get("title") or ""
+        if old_title and not new_title:
+            return str(path.relative_to(data_dir))
     path.write_text(html, encoding="utf-8")
     return str(path.relative_to(data_dir))
 
@@ -246,6 +283,8 @@ def normalize_result(result, entry):
     if source_key in {"xhs", "dianping"}:
         text = clean_share_page_noise(text)
         result["images"] = clean_share_page_images(result.get("images") or [])
+    if source_key == "zhihu":
+        text = clean_zhihu_page_noise(text)
     result["text"] = text
     return result
 
@@ -255,6 +294,9 @@ def detect_content_access_requirement(entry, result):
     text = clean_text(result.get("text") or "")
     lower_text = text.lower()
     title = clean_inline(result.get("title") or entry.get("title") or "")
+
+    if source_key == "zhihu" and len(text) >= 1200:
+        return ""
 
     if source_key == "wsj":
         has_dow_jones_footer = "dow jones" in lower_text and "all rights reserved" in lower_text
@@ -302,13 +344,47 @@ def detect_content_access_requirement(entry, result):
 def apply_result_title(entry, result):
     if entry.get("renamedAt"):
         return
-    title = clean_inline(result.get("title") or "")
+    title = best_result_title(entry, result)
     if not title or not should_replace_entry_title(entry):
         return
     entry["title"] = shorten_inline(title, 120)
     entry["metadataTitle"] = entry["title"]
     entry["metadataFetchedAt"] = now_ms()
     entry["metadataSource"] = result.get("method") or "content_pipeline"
+
+
+def best_result_title(entry, result):
+    source_key = entry.get("sourceKey") or ""
+    title = clean_inline(result.get("title") or "")
+    if source_key == "xhs":
+        title = clean_xhs_title(title)
+        if title and not is_generic_xhs_title(title):
+            return title
+        return title_from_content(result.get("description") or result.get("text") or "")
+    return title
+
+
+def title_from_content(value, max_length=46):
+    text = clean_inline(remove_urls(value or ""))
+    text = re.sub(r"#\S+", "", text).strip()
+    if not text:
+        return ""
+    sentence = re.split(r"[。！？!?]\s*", text, 1)[0].strip() or text
+    return shorten_inline(sentence, max_length)
+
+
+def is_generic_xhs_title(title):
+    title = clean_inline(title)
+    if not title or title == "小红书收藏" or re.fullmatch(r"小红书笔记\s+[0-9a-fA-F.]+", title):
+        return True
+    noise = ["网上有害信息举报专区", "小红书_沪ICP备", "小红书_营业执照", "小红书_沪公网安备", "小红书_网文"]
+    return any(item in title for item in noise)
+
+
+def clean_xhs_title(title):
+    title = clean_inline(title)
+    title = re.sub(r"\s*[-_]\s*小红书\s*$", "", title)
+    return title.strip()
 
 
 def should_replace_entry_title(entry):
@@ -329,6 +405,10 @@ def should_replace_entry_title(entry):
         "网页",
     }
     if title in generic:
+        return True
+    if source_key == "xhs" and is_generic_xhs_title(title):
+        return True
+    if source_key == "zhihu" and re.fullmatch(r"知乎(问题|文章)\s+\d+", title):
         return True
     if source_key == "x" and re.fullmatch(r"@[\w.-]+\s+的帖子", title):
         return True
@@ -375,8 +455,32 @@ def clean_share_page_noise(text):
             continue
         if "把内容复制好" in line:
             continue
+        if is_platform_footer_line(line):
+            continue
         cleaned.append(line)
     return clean_text("\n".join(cleaned))
+
+
+def is_platform_footer_line(line):
+    footer_signals = [
+        "沪ICP备",
+        "营业执照",
+        "沪公网安备",
+        "增值电信业务经营许可证",
+        "医疗器械网络交易服务",
+        "互联网药品信息服务资格证书",
+        "违法不良信息举报电话",
+        "上海市互联网举报中心",
+        "网上有害信息举报专区",
+        "网络文化经营许可证",
+        "个性化推荐算法",
+        "行吟信息科技",
+    ]
+    if line in {"通知", "加载中"}:
+        return True
+    if line.startswith("© 2014-") or line.startswith("地址：") or line.startswith("电话："):
+        return True
+    return any(signal in line for signal in footer_signals)
 
 
 def clean_share_page_images(images):
@@ -851,7 +955,13 @@ def crawl_article_page(entry):
         if og_image:
             images.append({"url": urljoin(final_url, og_image), "alt": "页面图片"})
 
+    xhs_data = extract_xhs_page_data(html, final_url) if entry.get("sourceKey") == "xhs" else {}
+    zhihu_data = extract_zhihu_page_data(html, final_url) if entry.get("sourceKey") == "zhihu" else {}
+
     title = (
+        xhs_data.get("title")
+        or zhihu_data.get("title")
+        or
         find_meta_content(html, "property", "og:title")
         or find_meta_content(html, "name", "twitter:title")
         or find_tag_title(html)
@@ -859,7 +969,7 @@ def crawl_article_page(entry):
         or ""
     )
     site_name = find_meta_content(html, "property", "og:site_name") or (urlparse(final_url).hostname or "")
-    description = find_meta_content(html, "property", "og:description") or find_meta_content(html, "name", "description")
+    description = xhs_data.get("description") or find_meta_content(html, "property", "og:description") or find_meta_content(html, "name", "description")
     author = (
         find_meta_content(html, "name", "author")
         or find_meta_content(html, "property", "article:author")
@@ -874,7 +984,11 @@ def crawl_article_page(entry):
     )
 
     if not text:
-        text = remove_urls(entry.get("rawText") or "")
+        text = zhihu_data.get("text") or xhs_data.get("text") or remove_urls(entry.get("rawText") or "")
+    elif zhihu_data.get("text") and len(zhihu_data["text"]) > len(text):
+        text = zhihu_data["text"]
+    if xhs_data.get("images"):
+        images = dedupe_images(xhs_data["images"] + images)
     return {
         "title": clean_inline(title),
         "text": text,
@@ -886,6 +1000,148 @@ def crawl_article_page(entry):
         "rawHtml": html,
         "images": dedupe_images(images),
     }
+
+
+def extract_xhs_page_data(html, final_url):
+    title = ""
+    for value in find_json_string_values(html, "title"):
+        candidate = clean_inline(value)
+        if is_valid_xhs_structured_title(candidate):
+            title = candidate
+            break
+
+    description = ""
+    for value in find_json_string_values(html, "desc"):
+        candidate = clean_text(value)
+        if len(candidate) > len(description):
+            description = candidate
+
+    images = []
+    for value in find_json_string_values(html, "urlDefault"):
+        if value.startswith(("http://", "https://")):
+            images.append({"url": urljoin(final_url, value), "alt": title or "小红书图片"})
+    return {
+        "title": title,
+        "description": clean_inline(description),
+        "text": clean_text(description),
+        "images": dedupe_images(images),
+    }
+
+
+def extract_zhihu_page_data(html, final_url):
+    title = clean_zhihu_title(
+        find_meta_content(html, "property", "og:title")
+        or find_meta_content(html, "name", "twitter:title")
+        or find_tag_title(html)
+    )
+    for value in find_json_string_values(html, "title"):
+        candidate = clean_zhihu_title(value)
+        if candidate and not is_generic_zhihu_title(candidate):
+            title = candidate
+            break
+
+    candidates = []
+    for key in ["content", "excerpt", "description"]:
+        for value in find_json_string_values(html, key):
+            text = clean_zhihu_page_noise(html_to_text(value))
+            if is_useful_zhihu_text(text):
+                candidates.append(text)
+
+    text = max(candidates, key=len) if candidates else ""
+    return {
+        "title": title,
+        "text": text,
+        "images": [],
+    }
+
+
+def clean_zhihu_title(title):
+    title = clean_inline(title)
+    title = re.sub(r"\s*[-_]\s*知乎\s*$", "", title)
+    title = re.sub(r"\s*-\s*知乎.*$", "", title)
+    return clean_inline(title)
+
+
+def is_generic_zhihu_title(title):
+    value = clean_inline(title).lower()
+    return not value or value in {"知乎", "zhihu"} or value.startswith("知乎 -")
+
+
+def is_useful_zhihu_text(text):
+    if not text or len(text) < 80:
+        return False
+    lower = text.lower()
+    noise = ["登录后答题", "打开知乎 app", "验证码", "安全验证", "隐私保护指引"]
+    return not any(item.lower() in lower for item in noise)
+
+
+def clean_zhihu_page_noise(text):
+    lines = []
+    for line in clean_text(text).splitlines():
+        item = clean_inline(line)
+        if not item:
+            continue
+        if is_zhihu_noise_line(item):
+            continue
+        lines.append(item)
+    return clean_text("\n".join(lines))
+
+
+def is_zhihu_noise_line(line):
+    lower = line.lower()
+    exact_noise = {
+        "知乎",
+        "首页",
+        "会员",
+        "发现",
+        "等你来答",
+        "登录",
+        "注册",
+        "切换模式",
+        "写回答",
+        "添加评论",
+        "分享",
+        "收藏",
+        "喜欢",
+        "收起",
+        "展开阅读全文",
+        "继续浏览内容",
+        "打开知乎 app",
+    }
+    if line in exact_noise:
+        return True
+    fragments = [
+        "知乎隐私保护指引",
+        "知乎用户服务协议",
+        "下载知乎客户端",
+        "有问题，就会有答案",
+        "登录后你可以",
+        "不限量看优质回答",
+        "还没有帐号",
+        "验证码",
+        "安全验证",
+    ]
+    if re.fullmatch(r"查看全部\s+\d+\s+个回答", line):
+        return True
+    return any(fragment.lower() in lower for fragment in fragments)
+
+
+def find_json_string_values(html, key):
+    values = []
+    pattern = rf'"{re.escape(key)}"\s*:\s*"((?:\\.|[^"\\])*)"'
+    for match in re.finditer(pattern, html or ""):
+        try:
+            values.append(json.loads(f'"{match.group(1)}"'))
+        except json.JSONDecodeError:
+            continue
+    return values
+
+
+def is_valid_xhs_structured_title(title):
+    if not title or len(title) < 3:
+        return False
+    noise = ["网上有害信息举报专区", "小红书", "登录", "验证码", "隐私", "cookie"]
+    return not any(item.lower() in title.lower() for item in noise)
 
 
 def select_article_block(html, source_key):

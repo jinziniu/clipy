@@ -5,8 +5,8 @@ import {
   getEntryTitle,
   getLinkTitle,
   getSource,
-} from "./sources/registry.js?v=20260511-instant-add";
-import { getCommonLogoCandidates } from "./sources/logos.js?v=20260511-instant-add";
+} from "./sources/registry.js?v=20260513-ai-reader-refresh";
+import { getCommonLogoCandidates } from "./sources/logos.js?v=20260513-ai-reader-refresh";
 
 const DB_NAME = "clipy-bookmarks";
 const DB_VERSION = 1;
@@ -19,6 +19,8 @@ const state = {
   entries: [],
   pendingFiles: [],
   expandedEntries: new Set(),
+  expandedAiSummaries: new Set(),
+  entryPolls: new Map(),
   verificationPolls: new Map(),
   profileOpenPolls: new Map(),
   browserSessions: [],
@@ -30,6 +32,11 @@ const state = {
   repositoryMenuId: "",
   repositoryPickerQuery: "",
   repositoryRenamingId: "",
+  searchQuery: "",
+  searchResults: [],
+  searchSnippets: new Map(),
+  searchTimer: 0,
+  isSearching: false,
   storageMode: "browser",
   storagePath: "",
   isAdding: false,
@@ -60,6 +67,8 @@ const elements = {
   repositoryPanel: document.querySelector("#repositoryPanel"),
   repositoryPanelHeader: document.querySelector("#repositoryPanelHeader"),
   repositoryPicker: document.querySelector("#repositoryPicker"),
+  searchClearButton: document.querySelector("#searchClearButton"),
+  searchInput: document.querySelector("#searchInput"),
   sessionButton: document.querySelector("#sessionButton"),
   sessionCloseButton: document.querySelector("#sessionCloseButton"),
   sessionList: document.querySelector("#sessionList"),
@@ -310,6 +319,22 @@ async function requestEntryReparse(entry) {
   return response.json();
 }
 
+async function requestEntrySummary(entry) {
+  if (!isDiskStorage()) throw new Error("Summary requires disk storage");
+  const response = await fetch(`${API_ROOT}/entries/${encodeURIComponent(entry.id)}/summarize`, {
+    method: "POST",
+  });
+  if (!response.ok) throw new Error("Summary failed");
+  return response.json();
+}
+
+async function requestSearch(query) {
+  if (!isDiskStorage()) return { results: [] };
+  const response = await fetch(`${API_ROOT}/search?q=${encodeURIComponent(query)}`, { cache: "no-store" });
+  if (!response.ok) throw new Error("Search failed");
+  return response.json();
+}
+
 async function requestEntryProfileOpen(entry) {
   if (!isDiskStorage()) throw new Error("Profile open requires disk storage");
   const response = await fetch(`${API_ROOT}/open/${encodeURIComponent(entry.id)}`, {
@@ -496,6 +521,34 @@ function setupEvents() {
     }
   });
 
+  elements.searchInput?.addEventListener("input", () => {
+    state.searchQuery = elements.searchInput.value.trim();
+    window.clearTimeout(state.searchTimer);
+    if (!state.searchQuery) {
+      state.searchResults = [];
+      state.searchSnippets = new Map();
+      state.isSearching = false;
+      render();
+      return;
+    }
+    state.isSearching = true;
+    render();
+    state.searchTimer = window.setTimeout(() => {
+      runSearch(state.searchQuery);
+    }, 250);
+  });
+
+  elements.searchClearButton?.addEventListener("click", () => {
+    elements.searchInput.value = "";
+    state.searchQuery = "";
+    state.searchResults = [];
+    state.searchSnippets = new Map();
+    state.isSearching = false;
+    window.clearTimeout(state.searchTimer);
+    render();
+    elements.searchInput.focus();
+  });
+
   ["dragenter", "dragover"].forEach((eventName) => {
     elements.dropZone.addEventListener(eventName, (event) => {
       event.preventDefault();
@@ -633,6 +686,30 @@ async function handleCreateRepository() {
   } catch (error) {
     console.error(error);
     showNotice("新建仓库失败，请确认本地服务还在运行。", true);
+  }
+}
+
+async function runSearch(query) {
+  try {
+    const payload = await requestSearch(query);
+    if (query !== state.searchQuery) return;
+    const results = payload.results || [];
+    state.searchResults = results.map((result) => result.entry).filter(Boolean);
+    state.searchSnippets = new Map(
+      results
+        .filter((result) => result.entry?.id && result.snippet)
+        .map((result) => [result.entry.id, result.snippet]),
+    );
+    state.isSearching = false;
+    render();
+  } catch (error) {
+    console.error(error);
+    if (query !== state.searchQuery) return;
+    state.searchResults = [];
+    state.searchSnippets = new Map();
+    state.isSearching = false;
+    showNotice("搜索失败，请确认本地服务还在运行。", true);
+    render();
   }
 }
 
@@ -1119,6 +1196,7 @@ async function persistOptimisticEntry(entry, persist) {
     updateLinkBackup();
     render();
     scheduleDiskRefresh();
+    startEntryPolling(savedEntry.id || entry.id);
   } catch (error) {
     console.error(error);
     markEntryFailed(entry.id, "保存失败，请确认本地服务还在运行");
@@ -1224,24 +1302,31 @@ function renderPendingFiles() {
 function render() {
   const entries = sortEntries(state.entries);
   const activeRepository = getActiveRepository();
+  const isSearchActive = Boolean(state.searchQuery);
   if (state.activeFilter === "repository" && !activeRepository) {
     state.activeFilter = "all";
     state.activeRepositoryId = "";
     state.repositoryEditOpen = false;
   }
-  const filteredEntries = entries.filter((entry) => {
+  const filteredEntries = isSearchActive ? state.searchResults : entries.filter((entry) => {
     if (state.activeFilter === "all") return true;
     if (state.activeFilter === "file") return entry.kind === "file" || entry.kind === "file-batch";
     if (state.activeFilter === "repository") return activeRepositoryEntryIds().has(entry.id);
     return entry.kind === state.activeFilter;
   });
 
-  elements.entryCount.textContent = `${entries.length} 条收藏`;
+  elements.entryCount.textContent = isSearchActive ? `${filteredEntries.length} 条搜索结果` : `${entries.length} 条收藏`;
   elements.emptyState.classList.toggle("hidden", filteredEntries.length > 0);
+  renderSearchControls();
   renderEmptyState(activeRepository);
   elements.timeline.replaceChildren();
   renderRepositoryChips();
-  renderRepositoryPanel();
+  if (isSearchActive) {
+    elements.repositoryPanel.hidden = true;
+    elements.repositoryPanel.classList.add("hidden");
+  } else {
+    renderRepositoryPanel();
+  }
 
   document.querySelectorAll(".filter-chip").forEach((button) => {
     const isRepositoryChip = Boolean(button.dataset.repositoryId);
@@ -1261,6 +1346,11 @@ function renderEmptyState(activeRepository) {
   const title = elements.emptyState?.querySelector("h2");
   const copy = elements.emptyState?.querySelector("p");
   if (!title || !copy) return;
+  if (state.searchQuery) {
+    title.textContent = state.isSearching ? "正在搜索" : "没有找到结果";
+    copy.textContent = state.isSearching ? "正在搜索本地标题、正文和标签。" : "换个关键词再试。";
+    return;
+  }
   if (state.activeFilter === "repository" && activeRepository) {
     title.textContent = "这个仓库还没有内容";
     copy.textContent = "在上方列表勾选收藏，就会加入这里。";
@@ -1268,6 +1358,14 @@ function renderEmptyState(activeRepository) {
   }
   title.textContent = "还没有收藏";
   copy.textContent = "把链接或文件放到上方，就会按时间进入这里。";
+}
+
+function renderSearchControls() {
+  if (!elements.searchInput || !elements.searchClearButton) return;
+  if (elements.searchInput.value.trim() !== state.searchQuery) {
+    elements.searchInput.value = state.searchQuery;
+  }
+  elements.searchClearButton.classList.toggle("hidden", !state.searchQuery);
 }
 
 function renderRepositoryChips() {
@@ -1556,6 +1654,20 @@ function renderTimelineItem(entry) {
     actions.prepend(verifyButton);
   }
 
+  if (shouldShowReaderAction(entry)) {
+    const readerButton = document.createElement("button");
+    readerButton.className = "entry-action entry-verify entry-reader";
+    readerButton.type = "button";
+    readerButton.textContent = "阅读";
+    readerButton.title = "打开本地阅读模式";
+    readerButton.setAttribute("aria-label", "打开本地阅读模式");
+    readerButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      openReader(entry);
+    });
+    actions.prepend(readerButton);
+  }
+
   if (shouldShowReparseAction(entry, knowledgeStatus)) {
     const reparseButton = document.createElement("button");
     reparseButton.className = "entry-action entry-verify";
@@ -1569,6 +1681,38 @@ function renderTimelineItem(entry) {
     });
     actions.prepend(reparseButton);
   }
+
+  if (shouldShowSummaryAction(entry, knowledgeStatus)) {
+    const summaryButton = document.createElement("button");
+    summaryButton.className = "entry-action entry-verify";
+    summaryButton.type = "button";
+    summaryButton.textContent = entry.aiStatus === "summarizing" && !isStaleAiSummary(entry) ? "总结中" : "AI 总结";
+    summaryButton.title = "生成 AI 摘要";
+    summaryButton.setAttribute("aria-label", "生成 AI 摘要");
+    summaryButton.disabled = entry.aiStatus === "summarizing" && !isStaleAiSummary(entry);
+    summaryButton.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      await summarizeEntry(entry);
+    });
+    actions.prepend(summaryButton);
+  }
+
+  if (shouldShowAiToggleAction(entry)) {
+    const toggleAiButton = document.createElement("button");
+    toggleAiButton.className = "entry-action entry-verify entry-ai-toggle";
+    toggleAiButton.type = "button";
+    toggleAiButton.textContent = state.expandedAiSummaries.has(entry.id) ? "隐藏" : "AI 摘要";
+    toggleAiButton.title = state.expandedAiSummaries.has(entry.id) ? "隐藏 AI 摘要" : "显示 AI 摘要";
+    toggleAiButton.setAttribute("aria-label", toggleAiButton.title);
+    toggleAiButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      toggleAiSummary(entry.id);
+    });
+    actions.prepend(toggleAiButton);
+  }
+
+  renderSearchSnippet(entryDetails, entry);
+  renderAiSummary(entryDetails, entry, state.expandedAiSummaries.has(entry.id));
 
   if (entry.kind === "file-batch") {
     renderFileBatchDetails(entryDetails, entry);
@@ -1624,6 +1768,7 @@ function renderTimelineItem(entry) {
       state.entries = state.entries.filter((itemEntry) => itemEntry.id !== entry.id);
       removeEntryFromLocalRepositories(entry.id);
       state.expandedEntries.delete(entry.id);
+      state.expandedAiSummaries.delete(entry.id);
       updateLinkBackup();
       showNotice("已删除。");
       render();
@@ -1645,8 +1790,104 @@ function shouldShowReparseAction(entry, knowledgeStatus) {
   return isDiskStorage() && entry.kind === "link" && knowledgeStatus.kind === "failed";
 }
 
+function shouldShowReaderAction(entry) {
+  return isDiskStorage() && entry.kind === "link" && Boolean(entry.item?.snapshotPath || entry.item?.contentPath);
+}
+
+function shouldShowSummaryAction(entry, knowledgeStatus) {
+  if (!isDiskStorage() || entry.kind !== "link") return false;
+  if (knowledgeStatus.kind === "processing") return false;
+  if ((entry.content?.status || "") !== "ready" && (entry.item?.status || "") !== "ready") return false;
+  return entry.aiStatus !== "ready" || isStaleAiSummary(entry);
+}
+
+function shouldShowAiToggleAction(entry) {
+  const ai = entry.ai || {};
+  return entry.aiStatus === "ready" && Boolean(ai.summary || ai.keyPoints?.length || ai.suggestedTags?.length);
+}
+
+function isStaleAiSummary(entry) {
+  if ((entry.aiStatus || entry.ai?.status || "") !== "summarizing") return false;
+  const updatedAt = Number(entry.ai?.updatedAt || 0);
+  return Boolean(updatedAt && Date.now() - updatedAt > 3 * 60 * 1000);
+}
+
 function getVerifyButtonLabel(knowledgeStatus) {
   return "打开补全";
+}
+
+function openReader(entry) {
+  window.open(`${API_ROOT}/reader/${encodeURIComponent(entry.id)}`, "_blank", "noopener");
+}
+
+function toggleAiSummary(entryId) {
+  if (state.expandedAiSummaries.has(entryId)) {
+    state.expandedAiSummaries.delete(entryId);
+  } else {
+    state.expandedAiSummaries.add(entryId);
+  }
+  render();
+}
+
+function renderAiSummary(container, entry, isExpanded = false) {
+  const ai = entry.ai || {};
+  const summary = ai.summary || "";
+  const keyPoints = Array.isArray(ai.keyPoints) ? ai.keyPoints : [];
+  const tags = Array.isArray(ai.suggestedTags) ? ai.suggestedTags : [];
+  if (!summary && !keyPoints.length && !tags.length && entry.aiStatus !== "summarizing") return;
+  if (!isExpanded && entry.aiStatus !== "summarizing") return;
+
+  container.hidden = false;
+  container.classList.remove("batch-expanded-details", "batch-preview-details");
+  const panel = document.createElement("div");
+  panel.className = "ai-summary";
+
+  const title = document.createElement("div");
+  title.className = "ai-summary-title";
+  title.textContent = entry.aiStatus === "summarizing" ? "AI 正在总结" : "AI 摘要";
+  panel.append(title);
+
+  if (summary) {
+    const paragraph = document.createElement("p");
+    paragraph.textContent = summary;
+    panel.append(paragraph);
+  }
+
+  if (keyPoints.length) {
+    const list = document.createElement("ul");
+    keyPoints.forEach((point) => {
+      const item = document.createElement("li");
+      item.textContent = point;
+      list.append(item);
+    });
+    panel.append(list);
+  }
+
+  if (tags.length) {
+    const tagRow = document.createElement("div");
+    tagRow.className = "ai-summary-tags";
+    tags.forEach((tag) => {
+      const chip = document.createElement("span");
+      chip.textContent = tag;
+      tagRow.append(chip);
+    });
+    panel.append(tagRow);
+  }
+
+  container.append(panel);
+}
+
+function renderSearchSnippet(container, entry) {
+  if (!state.searchQuery) return;
+  const snippet = state.searchSnippets.get(entry.id);
+  if (!snippet) return;
+
+  container.hidden = false;
+  container.classList.remove("batch-expanded-details", "batch-preview-details");
+  const block = document.createElement("p");
+  block.className = "search-snippet";
+  block.textContent = snippet;
+  container.append(block);
 }
 
 async function reparseEntry(entry) {
@@ -1658,9 +1899,26 @@ async function reparseEntry(entry) {
     showNotice("已重新解析。");
     render();
     scheduleDiskRefresh();
+    startEntryPolling(entry.id);
   } catch (error) {
     console.error(error);
     showNotice("重新解析失败。", true);
+  }
+}
+
+async function summarizeEntry(entry) {
+  try {
+    const payload = await requestEntrySummary(entry);
+    if (payload.entry) {
+      state.entries = sortEntries(state.entries.map((item) => (item.id === entry.id ? payload.entry : item)));
+    }
+    showNotice("AI 总结已开始。");
+    render();
+    scheduleDiskRefresh();
+    startEntryPolling(entry.id);
+  } catch (error) {
+    console.error(error);
+    showNotice("AI 总结不可用，请检查配置。", true);
   }
 }
 
@@ -1683,6 +1941,29 @@ async function verifyEntry(entry) {
     console.error(error);
     showNotice("没有打开验证窗口，请稍后再试。", true);
   }
+}
+
+function startEntryPolling(entryId, durationMs = 5 * 60 * 1000) {
+  if (!isDiskStorage() || !entryId) return;
+  const existing = state.entryPolls.get(entryId);
+  if (existing) window.clearInterval(existing);
+
+  const startedAt = Date.now();
+  const timer = window.setInterval(async () => {
+    await refreshDiskEntries();
+    const entry = state.entries.find((item) => item.id === entryId);
+    const processingStatus = entry?.processingStatus || "";
+    const aiStatus = entry?.aiStatus || entry?.ai?.status || "";
+    const contentStatus = entry?.content?.status || "";
+    const doneProcessing = !processingStatus || ["ready", "failed"].includes(processingStatus);
+    const doneAi = aiStatus !== "summarizing";
+    const hasSettledContent = !entry || contentStatus || doneProcessing;
+    if (!entry || (doneProcessing && doneAi && hasSettledContent) || Date.now() - startedAt > durationMs) {
+      window.clearInterval(timer);
+      state.entryPolls.delete(entryId);
+    }
+  }, 2000);
+  state.entryPolls.set(entryId, timer);
 }
 
 function startVerificationPolling(entryId, durationMs = 5 * 60 * 1000) {

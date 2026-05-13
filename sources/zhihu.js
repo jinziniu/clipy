@@ -13,7 +13,8 @@ export const zhihuSource = {
   match({ host }) {
     return host.includes("zhihu.com");
   },
-  buildTitle({ sharedTitle, pathParts }) {
+  buildTitle({ sharedTitle, pathParts, metadataTitle }) {
+    if (metadataTitle) return metadataTitle;
     if (sharedTitle) return sharedTitle;
     if (pathParts[0] === "question" && pathParts[1]) return `知乎问题 ${pathParts[1]}`;
     if (pathParts[0] === "p" && pathParts[1]) return `知乎文章 ${pathParts[1]}`;
