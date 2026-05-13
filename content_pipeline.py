@@ -170,10 +170,21 @@ def capture_browser_result_for_entry(entry, data_dir, browser_result):
         }
         return entry
 
+    source_key = entry.get("sourceKey") or ""
+    xhs_data = extract_xhs_page_data(browser_result.get("html") or "", browser_result.get("finalUrl") or entry.get("url") or "") if source_key == "xhs" else {}
+
     text = clean_text(browser_result.get("text") or "")
-    if (entry.get("sourceKey") or "") == "zhihu":
+    if source_key == "xhs":
+        structured_text = clean_share_page_noise(xhs_data.get("text") or xhs_data.get("description") or "")
+        text = structured_text or clean_share_page_noise(text)
+    if source_key == "zhihu":
         text = clean_zhihu_page_noise(text)
     images = browser_result.get("images") or []
+    if source_key == "xhs":
+        images = clean_share_page_images(dedupe_images((xhs_data.get("images") or []) + images))
+        has_structured_xhs = bool(xhs_data.get("title") or xhs_data.get("text") or xhs_data.get("images"))
+        if not has_structured_xhs and len(text) < 200 and (entry.get("content") or {}).get("status") == "ready":
+            return entry
     if not text and not images:
         html_path = write_browser_html_snapshot(entry, browser_result, data_dir)
         entry["content"] = {
@@ -187,7 +198,7 @@ def capture_browser_result_for_entry(entry, data_dir, browser_result):
         return entry
 
     result = {
-        "title": clean_inline(browser_result.get("title") or browser_result.get("documentTitle") or entry.get("title") or ""),
+        "title": clean_inline(xhs_data.get("title") or browser_result.get("title") or browser_result.get("documentTitle") or entry.get("title") or ""),
         "text": text,
         "author": clean_inline(browser_result.get("author") or ""),
         "publishedAt": clean_inline(browser_result.get("publishedAt") or ""),
@@ -294,6 +305,10 @@ def detect_content_access_requirement(entry, result):
     text = clean_text(result.get("text") or "")
     lower_text = text.lower()
     title = clean_inline(result.get("title") or entry.get("title") or "")
+
+    if source_key == "xhs":
+        if title in {"安全限制", "小红书 - 安全验证"} or "ip存在风险" in lower_text or "安全限制" in text:
+            return "小红书返回了安全限制页面，需要稍后或在 Clipy 浏览器里补全"
 
     if source_key == "zhihu" and len(text) >= 1200:
         return ""
@@ -1013,15 +1028,15 @@ def extract_xhs_page_data(html, final_url):
     description = ""
     for value in find_json_string_values(html, "desc"):
         candidate = clean_text(value)
-        if len(candidate) > len(description):
+        if is_valid_xhs_description(candidate) and len(candidate) > len(description):
             description = candidate
 
     images = []
-    for value in find_json_string_values(html, "urlDefault"):
+    for value in find_json_string_values(html, "urlDefault") + find_json_string_values(html, "urlPre"):
         if value.startswith(("http://", "https://")):
             images.append({"url": urljoin(final_url, value), "alt": title or "小红书图片"})
     return {
-        "title": title,
+        "title": clean_xhs_title(title),
         "description": clean_inline(description),
         "text": clean_text(description),
         "images": dedupe_images(images),
@@ -1142,6 +1157,15 @@ def is_valid_xhs_structured_title(title):
         return False
     noise = ["网上有害信息举报专区", "小红书", "登录", "验证码", "隐私", "cookie"]
     return not any(item.lower() in title.lower() for item in noise)
+
+
+def is_valid_xhs_description(description):
+    value = clean_inline(description)
+    if not value or len(value) < 4:
+        return False
+    lower = value.lower()
+    noise = ["cookie", "隐私", "营业执照", "网上有害信息举报专区", "验证码", "登录"]
+    return not any(item.lower() in lower for item in noise)
 
 
 def select_article_block(html, source_key):

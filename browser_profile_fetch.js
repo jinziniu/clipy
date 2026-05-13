@@ -227,6 +227,11 @@ async function evaluatePage(client) {
       meta('meta[name="pubdate"]') ||
       meta('meta[name="date"]')
     );
+    const answerMatch = location.pathname.match(/\\/answer\\/(\\d+)/);
+    const zhihuAnswer = answerMatch
+      ? document.querySelector('.ContentItem.AnswerItem[name="' + answerMatch[1] + '"]')
+      : null;
+    const zhihuContent = zhihuAnswer?.querySelector('.RichContent-inner, .RichText, [itemprop="text"]') || null;
     const selectors = [
       "#js_content",
       "#readme .markdown-body",
@@ -251,12 +256,16 @@ async function evaluatePage(client) {
       ".article-content",
       ".body-content"
     ];
-    const blocks = selectors
+    const blocks = [zhihuContent]
+      .filter(Boolean)
+      .map((element) => clean(element.innerText || ""))
+      .filter((text) => text.length > 40)
+      .concat(selectors
       .map((selector) => document.querySelector(selector))
       .filter(Boolean)
       .map((element) => clean(element.innerText || ""))
       .filter((text) => text.length > 40)
-      .sort((a, b) => b.length - a.length);
+      .sort((a, b) => b.length - a.length));
     const tweetText = Array.from(document.querySelectorAll('[data-testid="tweetText"]'))
       .map((element) => clean(element.innerText || ""))
       .filter(Boolean)
@@ -264,7 +273,8 @@ async function evaluatePage(client) {
     const bodyText = clean(document.body?.innerText || "");
     const text = clean(tweetText || blocks[0] || bodyText).slice(0, 450000);
     const html = String(document.documentElement?.outerHTML || "").slice(0, 1500000);
-    const images = Array.from(document.images || [])
+    const imageRoot = zhihuContent || document;
+    const images = Array.from(imageRoot.images || imageRoot.querySelectorAll?.("img") || [])
       .map((image) => ({
         url: image.currentSrc || image.src || image.getAttribute("data-src") || image.getAttribute("data-original") || "",
         alt: clean(image.alt || image.getAttribute("aria-label") || "图片"),

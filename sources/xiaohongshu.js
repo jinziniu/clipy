@@ -15,11 +15,15 @@ export const xiaohongshuSource = {
     return host.includes("xiaohongshu.com") || host.includes("xhslink.com");
   },
   buildTitle({ sharedTitle, metadataTitle }) {
-    if (metadataTitle) return metadataTitle;
-    if (sharedTitle) return sharedTitle;
+    if (metadataTitle) return cleanXhsTitle(metadataTitle);
+    if (sharedTitle) return cleanXhsTitle(sharedTitle);
     return "小红书收藏";
   },
   async crawl() {
     return { status: "not_implemented", source: "xhs" };
   },
 };
+
+function cleanXhsTitle(title = "") {
+  return title.replace(/\s*[-_]\s*小红书\s*$/i, "").trim();
+}

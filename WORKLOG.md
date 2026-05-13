@@ -238,13 +238,37 @@ GET /api/search?q=...
 - Reader pages now inject the entry's AI summary, key points, and suggested tags above the saved content when summary data is ready.
 - Reader pages show an `AI 正在总结` state if opened while summarization is still running.
 - Fixed Zhihu list-title rendering so frontend source handlers prefer `metadataTitle` / browser-captured title over fallback titles such as `知乎问题 <id>`.
+- Replaced the reader endpoint's generic snapshot renderer with a dedicated reading renderer:
+  - unified title/source/time header
+  - AI summary above the article
+  - article body starts at `## 正文`
+  - no duplicated `content.md` front matter, title, source, URL, or saved-time lines
+  - responsive typography for desktop and mobile
+- Tightened Zhihu rendered capture for answer URLs:
+  - extracts the target `.ContentItem.AnswerItem[name="<answer_id>"]`
+  - uses the target answer's `.RichContent-inner` instead of the whole page
+  - avoids saving related answers, sidebar/footer text, and QR/login images as article body
+- Reprocessed local Zhihu entry `aff1f193-5c88-488d-bb7b-ad1740d21ad6`; its saved content now starts directly with the target answer text.
+- Fixed local browser opens for reader and file preview by forcing `http://` on `localhost` / `127.0.0.1`, avoiding Chrome HTTPS auto-upgrade errors such as `ERR_SSL_PROTOCOL_ERROR`.
 - Bumped static asset query strings for `app.js` and `styles.css`.
+
+### 2026-05-13 Xiaohongshu Rendered Capture
+
+- Xiaohongshu links no longer stop at a static `ready` result; they continue to try Clipy's browser profile so rendered note JSON can improve title/body/image capture.
+- Browser-profile Xiaohongshu capture now prefers structured note data from page HTML:
+  - cleaned note title
+  - note `desc` as正文
+  - `urlDefault` / `urlPre` images
+- Weak Xiaohongshu browser results no longer overwrite an existing `ready` entry when the rendered page returns no structured note data and only a short safety/login text.
+- Added detection for Xiaohongshu safety-limit pages such as `安全限制` / `IP存在风险`.
+- Blocked metadata titles such as `安全限制` are dropped so they do not pollute list title rendering.
+- Xiaohongshu frontend titles strip trailing `- 小红书`, including old entries that have not been rebuilt.
+- Reprocessed local Xiaohongshu entry `ec5393f7-56d7-47b9-9d01-f36ff8e30086`; content was restored from the rich saved snapshot after a safety-limit response.
 
 ### Next Steps
 
 1. Improve Xiaohongshu and other dynamic sites using rendered-page capture or Playwright fallback.
-2. Add a separate raw snapshot action for archive inspection.
-3. Improve reader typography and add AI summary to reader page.
-4. Clean source-specific noise from more platforms.
-6. Add highlight and note support.
-7. Add embedding-based AI Q&A after summary is stable.
+2. Improve reader typography and add AI summary to reader page.
+3. Clean source-specific noise from more platforms.
+4. Add highlight and note support.
+5. Add embedding-based AI Q&A after summary is stable.

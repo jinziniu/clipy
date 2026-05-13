@@ -5,8 +5,8 @@ import {
   getEntryTitle,
   getLinkTitle,
   getSource,
-} from "./sources/registry.js?v=20260513-ai-reader-refresh";
-import { getCommonLogoCandidates } from "./sources/logos.js?v=20260513-ai-reader-refresh";
+} from "./sources/registry.js?v=20260513-xhs-rendered";
+import { getCommonLogoCandidates } from "./sources/logos.js?v=20260513-xhs-rendered";
 
 const DB_NAME = "clipy-bookmarks";
 const DB_VERSION = 1;
@@ -1817,7 +1817,18 @@ function getVerifyButtonLabel(knowledgeStatus) {
 }
 
 function openReader(entry) {
-  window.open(`${API_ROOT}/reader/${encodeURIComponent(entry.id)}`, "_blank", "noopener");
+  window.open(localApiUrl(`/reader/${encodeURIComponent(entry.id)}`), "_blank", "noopener");
+}
+
+function localApiUrl(path) {
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  const apiPath = `${API_ROOT}${normalizedPath}`;
+  const host = window.location.host || "127.0.0.1:4173";
+  const hostname = window.location.hostname;
+  if (hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1") {
+    return `http://${host}${apiPath}`;
+  }
+  return apiPath;
 }
 
 function toggleAiSummary(entryId) {
@@ -2515,7 +2526,7 @@ async function openDiskFile(entry, file = null) {
     // Fall through to browser preview.
   }
 
-  window.open(`${API_ROOT}/files/${filePath}`, "_blank", "noopener");
+  window.open(localApiUrl(`/files/${filePath}`), "_blank", "noopener");
 }
 
 function getMetaText(entry) {

@@ -7,7 +7,7 @@ from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 from urllib.request import Request, urlopen
 from browser_profile import fetch_with_browser_profile, open_visible_browser_profile, summarize_browser_result
 from content_pipeline import capture_browser_result_for_entry, capture_markdown_for_entry
-from item_pipeline import build_item_for_entry, markdown_to_html_document, remove_entry_item, write_items_index
+from item_pipeline import build_item_for_entry, markdown_to_html, markdown_to_html_document, remove_entry_item, strip_front_matter, write_items_index
 import gzip
 import hashlib
 import json
@@ -1229,12 +1229,14 @@ def binary_response(handler, body, content_type, status=200):
 
 
 def reader_html_from_markdown(entry, markdown):
-    title = escape(sanitize_title(entry.get("title") or "Clipy 阅读"))
-    body = strip_markdown_front_matter(markdown)
-    body = re.sub(r"&", "&amp;", body)
-    body = re.sub(r"<", "&lt;", body)
-    body = re.sub(r">", "&gt;", body)
-    paragraphs = "".join(f"<p>{line}</p>" for line in body.splitlines() if line.strip())
+    title_text = sanitize_title(entry.get("title") or "Clipy 阅读")
+    title = escape(title_text)
+    source_name = escape(entry.get("sourceName") or entry.get("sourceKey") or "收藏")
+    source_url = entry.get("url") or ""
+    source_link = f'<a href="{escape(source_url)}">{escape(urlparse(source_url).hostname or source_url)}</a>' if source_url else ""
+    saved_at = format_reader_time(entry.get("createdAt"))
+    body = markdown_to_html(reader_markdown_body(markdown))
+    ai_block = reader_ai_summary_block(entry)
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -1242,17 +1244,75 @@ def reader_html_from_markdown(entry, markdown):
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{title}</title>
   <style>
-    body {{ margin: 0; background: #f7f4ef; color: #1e2528; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; }}
-    main {{ max-width: 780px; margin: 0 auto; padding: 40px 24px 72px; background: #fffdf9; min-height: 100vh; }}
-    h1 {{ line-height: 1.25; }}
-    p {{ line-height: 1.75; white-space: pre-wrap; }}
+    :root {{ color-scheme: light; }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; background: #f4f1eb; color: #1f272a; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; }}
+    main {{ max-width: 820px; margin: 0 auto; padding: 42px 24px 80px; background: #fffdf9; min-height: 100vh; }}
+    .reader-header {{ margin-bottom: 22px; padding-bottom: 18px; border-bottom: 1px solid #e4ddd2; }}
+    .reader-source {{ margin: 0 0 12px; color: #66706f; font-size: 14px; }}
+    .reader-source a {{ color: #176b65; text-decoration: none; }}
+    .reader-title {{ margin: 0; color: #172123; font-size: 32px; line-height: 1.25; letter-spacing: 0; }}
+    .reader-meta {{ display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 12px; color: #78817f; font-size: 14px; }}
+    .reader-content h1 {{ display: none; }}
+    .reader-content h2 {{ margin-top: 34px; padding-top: 10px; color: #1f2c2e; font-size: 22px; line-height: 1.35; border-top: 1px solid #eee8dd; }}
+    .reader-content h3 {{ margin-top: 26px; font-size: 18px; line-height: 1.4; }}
+    .reader-content p, .reader-content li {{ color: #253033; font-size: 17px; line-height: 1.86; }}
+    .reader-content p {{ margin: 0 0 14px; }}
+    .reader-content ul {{ padding-left: 1.25rem; }}
+    .reader-content img {{ display: block; max-width: 100%; height: auto; margin: 18px auto; border-radius: 8px; }}
+    .reader-content a {{ color: #176b65; }}
+    .reader-ai {{ margin: 24px 0 32px; padding: 18px 20px; border: 1px solid #cfe2dc; border-radius: 8px; background: #f4fbf8; color: #173f3d; }}
+    .reader-ai h2 {{ margin: 0 0 10px; padding: 0; border: 0; font-size: 18px; }}
+    .reader-ai p {{ margin: 0 0 10px; font-size: 15px; line-height: 1.75; color: #173f3d; }}
+    .reader-ai ul {{ margin: 10px 0 0; padding-left: 1.25rem; }}
+    .reader-ai li {{ font-size: 15px; line-height: 1.65; }}
+    .reader-ai-tags {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }}
+    .reader-ai-tags span {{ padding: 4px 8px; border-radius: 999px; background: #dcefeb; font-size: 13px; }}
+    @media (max-width: 640px) {{
+      main {{ padding: 28px 18px 64px; }}
+      .reader-title {{ font-size: 25px; }}
+      .reader-content p, .reader-content li {{ font-size: 16px; line-height: 1.8; }}
+    }}
   </style>
 </head>
-<body><main><h1>{title}</h1>{paragraphs}</main></body>
+<body>
+  <main>
+    <header class="reader-header">
+      <p class="reader-source">{source_name}{f" · {source_link}" if source_link else ""}</p>
+      <h1 class="reader-title">{title}</h1>
+      <div class="reader-meta">{f"<span>保存于 {escape(saved_at)}</span>" if saved_at else ""}</div>
+    </header>
+    {ai_block}
+    <article class="reader-content">
+      {body}
+    </article>
+  </main>
+</body>
 </html>"""
 
 
-def inject_reader_ai_summary(entry, html):
+def reader_markdown_body(markdown):
+    body = strip_front_matter(markdown).strip()
+    match = re.search(r"(?m)^##\s+正文\s*$", body)
+    if match:
+        return body[match.end() :].strip()
+    lines = body.splitlines()
+    while lines and (not lines[0].strip() or lines[0].startswith("# ") or lines[0].startswith("- 来源：") or lines[0].startswith("- 原链接：") or lines[0].startswith("- 保存时间：")):
+        lines.pop(0)
+    return "\n".join(lines).strip()
+
+
+def format_reader_time(value):
+    try:
+        timestamp = int(value or 0) / 1000
+        if timestamp <= 0:
+            return ""
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(timestamp))
+    except Exception:
+        return ""
+
+
+def reader_ai_summary_block(entry):
     ai = entry.get("ai") or {}
     ai_status = entry.get("aiStatus") or ai.get("status") or ""
     summary = clean_inline_text(ai.get("summary") or "")
@@ -1260,37 +1320,31 @@ def inject_reader_ai_summary(entry, html):
     suggested_tags = clean_string_list(ai.get("suggestedTags") or [])
     if ai_status != "ready" and not summary and not key_points and not suggested_tags:
         if ai_status != "summarizing":
-            return html
-        block = """
+            return ""
+        return """
 <section class="reader-ai reader-ai-pending">
   <h2>AI 摘要</h2>
   <p>AI 正在总结。</p>
 </section>
 """
-    else:
-        parts = ['<section class="reader-ai">', "<h2>AI 摘要</h2>"]
-        if summary:
-            parts.append(f"<p>{escape(summary)}</p>")
-        if key_points:
-            parts.append("<ul>")
-            parts.extend(f"<li>{escape(point)}</li>" for point in key_points)
-            parts.append("</ul>")
-        if suggested_tags:
-            tags = "".join(f"<span>{escape(tag)}</span>" for tag in suggested_tags)
-            parts.append(f'<div class="reader-ai-tags">{tags}</div>')
-        parts.append("</section>")
-        block = "\n".join(parts)
+    parts = ['<section class="reader-ai">', "<h2>AI 摘要</h2>"]
+    if summary:
+        parts.append(f"<p>{escape(summary)}</p>")
+    if key_points:
+        parts.append("<ul>")
+        parts.extend(f"<li>{escape(point)}</li>" for point in key_points)
+        parts.append("</ul>")
+    if suggested_tags:
+        tags = "".join(f"<span>{escape(tag)}</span>" for tag in suggested_tags)
+        parts.append(f'<div class="reader-ai-tags">{tags}</div>')
+    parts.append("</section>")
+    return "\n".join(parts)
 
-    styles = """
-    .reader-ai { margin: 24px 0 32px; padding: 18px 20px; border: 1px solid #cfe2dc; border-radius: 8px; background: #f4fbf8; color: #173f3d; }
-    .reader-ai h2 { margin: 0 0 10px; font-size: 18px; }
-    .reader-ai p { margin: 0 0 10px; }
-    .reader-ai ul { margin: 10px 0 0; padding-left: 1.25rem; }
-    .reader-ai-tags { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
-    .reader-ai-tags span { padding: 4px 8px; border-radius: 999px; background: #dcefeb; font-size: 13px; }
-"""
-    if ".reader-ai" not in html:
-        html = html.replace("  </style>", styles + "  </style>", 1)
+
+def inject_reader_ai_summary(entry, html):
+    block = reader_ai_summary_block(entry)
+    if not block:
+        return html
     return html.replace("<main>", f"<main>\n{block}", 1)
 
 
@@ -1901,6 +1955,7 @@ def clean_page_title(title, url):
         " / X",
         " on X",
         " - 知乎",
+        " - 小红书",
         "的微博_微博",
     ]
     for suffix in suffixes:
@@ -1919,6 +1974,7 @@ def clean_page_title(title, url):
         "bloomberg - are you a robot?",
         "are you a robot?",
         "access denied",
+        "安全限制",
     }
     if title.lower() in blocked_titles or title.lower() == host.lower():
         return ""
@@ -1962,8 +2018,18 @@ def is_generic_saved_title(entry):
     return False
 
 
+def drop_blocked_metadata_title(entry):
+    title = clean_inline_text(entry.get("metadataTitle") or "")
+    if title in {"安全限制", "小红书 - 安全验证", "Access Denied", "Are you a robot?"}:
+        entry = dict(entry)
+        entry.pop("metadataTitle", None)
+        entry.pop("metadataFetchedAt", None)
+        entry.pop("metadataSource", None)
+    return entry
+
+
 def enrich_link_entry(entry):
-    entry = normalize_entry_source(entry)
+    entry = drop_blocked_metadata_title(normalize_entry_source(entry))
     url = entry.get("url")
     if not url or not is_generic_saved_title(entry):
         return entry
@@ -1980,7 +2046,7 @@ def enrich_link_entry(entry):
 
 
 def prepare_link_entry_for_initial_save(entry):
-    entry = normalize_entry_source(dict(entry))
+    entry = drop_blocked_metadata_title(normalize_entry_source(dict(entry)))
     if entry.get("kind") != "link" or not entry.get("url"):
         return entry
     if not is_generic_saved_title(entry):
@@ -2104,7 +2170,8 @@ def process_link_with_browser_profile(
     markdown_entry = capture_markdown_for_entry(entry, DATA_DIR, force=force_refresh)
     markdown_status = (markdown_entry.get("content") or {}).get("status") or ""
     should_use_profile_page = allow_visible_browser and prefer_existing_browser_tab and force_refresh
-    if markdown_status in {"ready", "skipped_video"} and not should_use_profile_page:
+    should_prefer_rendered_capture = (markdown_entry.get("sourceKey") or "") in {"xhs"}
+    if markdown_status in {"ready", "skipped_video"} and not should_use_profile_page and not should_prefer_rendered_capture:
         markdown_entry.pop("browserCapture", None)
         return markdown_entry
     if markdown_status == "needs_login" and not allow_visible_browser:
@@ -2926,8 +2993,7 @@ class ClipyHandler(SimpleHTTPRequestHandler):
         data_root = DATA_DIR.resolve()
 
         if content_path.exists() and content_path.is_file() and data_root in content_path.parents:
-            html = markdown_to_html_document(entry, content_path.read_text(encoding="utf-8", errors="replace"))
-            html = inject_reader_ai_summary(entry, html)
+            html = reader_html_from_markdown(entry, content_path.read_text(encoding="utf-8", errors="replace"))
             html = rewrite_reader_asset_links(entry_id, html)
             html_response(self, html)
             return
