@@ -265,10 +265,23 @@ GET /api/search?q=...
 - Xiaohongshu frontend titles strip trailing `- 小红书`, including old entries that have not been rebuilt.
 - Reprocessed local Xiaohongshu entry `ec5393f7-56d7-47b9-9d01-f36ff8e30086`; content was restored from the rich saved snapshot after a safety-limit response.
 
+### 2026-05-14 Xiaohongshu Image Assets
+
+- Xiaohongshu image URLs from saved/rendered page JSON are now normalized before download, including protocol-relative and HTTP CDN URLs.
+- Image download now sends Xiaohongshu-specific referer headers and recognizes Xiaohongshu CDN suffixes such as `_jpg_3` / `_webp_3`.
+- Browser-profile capture now tries to inline Xiaohongshu CDN images as `data:` payloads while the page can still access them, so later item generation can write local assets even if the CDN URL expires.
+- Markdown image download now accepts `data:` payloads and preserves richer duplicate image records, such as a later browser image carrying inline bytes for the same URL.
+- Existing Xiaohongshu snapshots are used as enrichment even when the current title is already good, so older rich snapshots can still provide missing images.
+- Reprocessed local Xiaohongshu entries:
+  - `ec5393f7-56d7-47b9-9d01-f36ff8e30086`: 6 images
+  - `ca4532a0-3ed0-4ce1-977c-afc99f65e169`: 2 images
+  - `75f9a161-e8bf-40cd-a003-307bb91f5f88`: 2 images
+  - `2b26d1f5-75c1-4a97-bd9d-c086b86f1c57`: 10 images
+
 ### Next Steps
 
-1. Improve Xiaohongshu and other dynamic sites using rendered-page capture or Playwright fallback.
-2. Improve reader typography and add AI summary to reader page.
+1. Verify Xiaohongshu reader images in the running app after restarting the real Clipy server on port 4173.
+2. Improve Xiaohongshu rendered-page recovery when a visible Clipy browser is already open.
 3. Clean source-specific noise from more platforms.
 4. Add highlight and note support.
 5. Add embedding-based AI Q&A after summary is stable.

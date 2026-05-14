@@ -202,7 +202,7 @@ async function closeTarget(targetId) {
 }
 
 async function evaluatePage(client) {
-  const expression = `(() => {
+  const expression = `(async () => {
     const clean = (value) => String(value || "")
       .replace(/\\u00a0/g, " ")
       .replace(/[\\t ]+/g, " ")
@@ -284,6 +284,49 @@ async function evaluatePage(client) {
       .filter((image) => image.url && !image.url.startsWith("data:"))
       .filter((image, index, array) => array.findIndex((item) => item.url === image.url) === index)
       .slice(0, 24);
+    const shouldInlineImage = (url) => {
+      try {
+        const parsed = new URL(url, location.href);
+        return /(^|\\.)xhscdn\\.com$/i.test(parsed.hostname) || /(^|\\.)xiaohongshu\\.com$/i.test(parsed.hostname);
+      } catch {
+        return false;
+      }
+    };
+    const arrayBufferToBase64 = (buffer) => {
+      const bytes = new Uint8Array(buffer);
+      const chunkSize = 0x8000;
+      let binary = "";
+      for (let index = 0; index < bytes.length; index += chunkSize) {
+        binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+      }
+      return btoa(binary);
+    };
+    const inlineImages = await Promise.all(images.slice(0, 12).map(async (image) => {
+      if (!shouldInlineImage(image.url)) return image;
+      try {
+        const response = await fetch(image.url, {
+          credentials: "include",
+          referrer: location.href,
+          signal: AbortSignal.timeout(7000)
+        });
+        if (!response.ok) return image;
+        const contentType = (response.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+        if (!contentType.startsWith("image/")) return image;
+        const blob = await response.blob();
+        if (blob.size > 10000000) return image;
+        return {
+          ...image,
+          contentType,
+          dataUrl: \`data:\${contentType};base64,\${arrayBufferToBase64(await blob.arrayBuffer())}\`
+        };
+      } catch {
+        return image;
+      }
+    }));
+    for (const inlineImage of inlineImages) {
+      const index = images.findIndex((image) => image.url === inlineImage.url);
+      if (index >= 0) images[index] = inlineImage;
+    }
     return {
       title,
       documentTitle: clean(document.title),

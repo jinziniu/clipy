@@ -93,8 +93,6 @@ def capture_markdown_for_entry(entry, data_dir, force=False):
 def enrich_result_from_existing_snapshot(entry, result, data_dir):
     if (entry.get("sourceKey") or "") != "xhs":
         return result
-    if result.get("title") and not is_generic_xhs_title(result.get("title")):
-        return result
 
     html_path = (entry.get("content") or {}).get("htmlPath") or ""
     if not html_path:
@@ -108,7 +106,9 @@ def enrich_result_from_existing_snapshot(entry, result, data_dir):
     except Exception:
         return result
 
-    if snapshot_data.get("title"):
+    if snapshot_data.get("title") and (
+        not result.get("title") or is_generic_xhs_title(result.get("title")) or len(snapshot_data["title"]) > len(result.get("title") or "")
+    ):
         result["title"] = snapshot_data["title"]
     if snapshot_data.get("description"):
         result["description"] = snapshot_data["description"]
@@ -998,7 +998,13 @@ def crawl_article_page(entry):
         or find_meta_content(html, "itemprop", "datePublished")
     )
 
-    if not text:
+    if xhs_data.get("text"):
+        text = clean_share_page_noise(xhs_data["text"])
+    elif entry.get("sourceKey") == "xhs":
+        text = clean_share_page_noise(text)
+        if not text:
+            text = remove_urls(entry.get("rawText") or "")
+    elif not text:
         text = zhihu_data.get("text") or xhs_data.get("text") or remove_urls(entry.get("rawText") or "")
     elif zhihu_data.get("text") and len(zhihu_data["text"]) > len(text):
         text = zhihu_data["text"]
@@ -1032,9 +1038,11 @@ def extract_xhs_page_data(html, final_url):
             description = candidate
 
     images = []
-    for value in find_json_string_values(html, "urlDefault") + find_json_string_values(html, "urlPre"):
-        if value.startswith(("http://", "https://")):
-            images.append({"url": urljoin(final_url, value), "alt": title or "小红书图片"})
+    image_values = find_json_string_values(html, "urlDefault") or find_json_string_values(html, "urlPre")
+    for value in image_values:
+        url = normalize_media_url(urljoin(final_url, value))
+        if url.startswith(("http://", "https://")):
+            images.append({"url": url, "alt": title or "小红书图片"})
     return {
         "title": clean_xhs_title(title),
         "description": clean_inline(description),
@@ -1315,11 +1323,16 @@ def build_markdown(entry, result, images, data_dir):
 def download_images(images, assets_dir):
     downloaded = []
     for image in dedupe_images(images)[:12]:
-        url = image.get("url")
-        if not url or url.startswith("data:"):
+        url = normalize_media_url(image.get("url") or "")
+        if not url:
             continue
         try:
-            body, content_type = fetch_binary(url, MAX_IMAGE_BYTES)
+            if image.get("dataUrl"):
+                body, content_type = decode_data_url(image["dataUrl"], MAX_IMAGE_BYTES)
+            elif url.startswith("data:"):
+                body, content_type = decode_data_url(url, MAX_IMAGE_BYTES)
+            else:
+                body, content_type = fetch_binary(url, MAX_IMAGE_BYTES)
         except Exception:
             continue
         extension = media_extension(content_type, url)
@@ -1372,10 +1385,13 @@ def fetch_json(url, timeout=6, headers=None):
 
 
 def fetch_binary(url, max_bytes):
+    url = normalize_media_url(url)
     parsed = urlparse(url)
     referer = f"{parsed.scheme}://{parsed.netloc}/" if parsed.scheme and parsed.netloc else ""
     if parsed.hostname and "sinaimg.cn" in parsed.hostname:
         referer = "https://weibo.com/"
+    if parsed.hostname and ("xhscdn.com" in parsed.hostname or "xiaohongshu.com" in parsed.hostname):
+        referer = "https://www.xiaohongshu.com/"
     request = Request(
         url,
         headers={
@@ -1392,6 +1408,37 @@ def fetch_binary(url, max_bytes):
         if len(body) > max_bytes:
             raise ValueError("image too large")
         return body, response.headers.get("Content-Type", "").split(";")[0].strip().lower()
+
+
+def decode_data_url(value, max_bytes):
+    match = re.match(r"^data:([^;,]+)?(;base64)?,(.*)$", value or "", re.S)
+    if not match:
+        raise ValueError("invalid data url")
+    content_type = (match.group(1) or "application/octet-stream").strip().lower()
+    payload = match.group(3) or ""
+    if match.group(2):
+        body = base64.b64decode(payload, validate=False)
+    else:
+        body = unquote(payload).encode("utf-8")
+    if len(body) > max_bytes:
+        raise ValueError("image too large")
+    return body, content_type
+
+
+def normalize_media_url(url):
+    url = clean_inline(url)
+    if url.startswith("//"):
+        url = f"https:{url}"
+    parsed = urlparse(url)
+    if parsed.scheme == "http" and parsed.hostname and ("xhscdn.com" in parsed.hostname or "xiaohongshu.com" in parsed.hostname):
+        url = f"https://{parsed.netloc}{parsed.path}"
+        if parsed.params:
+            url += f";{parsed.params}"
+        if parsed.query:
+            url += f"?{parsed.query}"
+        if parsed.fragment:
+            url += f"#{parsed.fragment}"
+    return url
 
 
 def extract_images(html, base_url):
@@ -1476,14 +1523,34 @@ def dedupe_images(images):
     result = []
     for image in images or []:
         url = image.get("url")
-        if not url or url in seen:
+        if not url:
+            continue
+        if url in seen:
+            for existing in result:
+                if existing.get("url") == url:
+                    if image.get("dataUrl") and not existing.get("dataUrl"):
+                        existing["dataUrl"] = image["dataUrl"]
+                    if image.get("contentType") and not existing.get("contentType"):
+                        existing["contentType"] = image["contentType"]
+                    break
             continue
         seen.add(url)
-        result.append(image)
+        result.append(dict(image))
     return result
 
 
 def media_extension(content_type, url):
+    content_type = (content_type or "").split(";")[0].strip().lower()
+    if content_type == "image/jpeg":
+        return ".jpg"
+    if content_type == "image/png":
+        return ".png"
+    if content_type == "image/gif":
+        return ".gif"
+    if content_type == "image/webp":
+        return ".webp"
+    if content_type == "image/svg+xml":
+        return ".svg"
     guessed = mimetypes.guess_extension(content_type or "")
     if guessed:
         return ".jpg" if guessed == ".jpe" else guessed
@@ -1492,6 +1559,10 @@ def media_extension(content_type, url):
     for extension in [".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"]:
         if path.endswith(extension):
             return ".jpg" if extension == ".jpeg" else extension
+    if re.search(r"[_-](?:jpg|jpeg)(?:_|$)", url.lower()):
+        return ".jpg"
+    if re.search(r"[_-]webp(?:_|$)", url.lower()):
+        return ".webp"
     return ""
 
 
