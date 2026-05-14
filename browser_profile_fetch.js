@@ -409,6 +409,9 @@ function classifyPage(page) {
     "please wait for verification",
     "请完成安全验证",
     "访问过于频繁",
+    "安全限制",
+    "ip存在风险",
+    "ip 存在风险",
   ];
 
   if (blockedSignals.some((signal) => combined.includes(signal))) return "blocked";

@@ -277,11 +277,18 @@ GET /api/search?q=...
   - `ca4532a0-3ed0-4ce1-977c-afc99f65e169`: 2 images
   - `75f9a161-e8bf-40cd-a003-307bb91f5f88`: 2 images
   - `2b26d1f5-75c1-4a97-bd9d-c086b86f1c57`: 10 images
+- Xiaohongshu background capture can now reuse an already-open Clipy browser profile instead of failing with `visibleBrowserOpen`.
+- Xiaohongshu safety-limit pages such as `安全限制` / `IP存在风险` are classified as blocked at the browser layer.
+- If Xiaohongshu already has `ready` local content, a blocked safety page no longer overwrites the saved markdown/assets.
+- Verified the local reader image route with a real Xiaohongshu item:
+  - `GET /api/reader/2b26d1f5-75c1-4a97-bd9d-c086b86f1c57` returns reader HTML with `/api/reader-assets/...` image URLs.
+  - `GET /api/reader-assets/2b26d1f5-75c1-4a97-bd9d-c086b86f1c57/image-01.jpg` returns `200 image/jpeg`.
+- Profile-open and verification workers now mark an entry as complete when recovered content is already `ready`, even if the watched visible browser tab has since closed.
 
 ### Next Steps
 
-1. Verify Xiaohongshu reader images in the running app after restarting the real Clipy server on port 4173.
-2. Improve Xiaohongshu rendered-page recovery when a visible Clipy browser is already open.
+1. Re-open the running app and visually confirm Xiaohongshu reader images render in Chrome.
+2. Re-run Xiaohongshu profile-open recovery on entries whose `profileOpen.status` was previously marked `closed` even though content is ready.
 3. Clean source-specific noise from more platforms.
 4. Add highlight and note support.
 5. Add embedding-based AI Q&A after summary is stable.

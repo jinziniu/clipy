@@ -149,6 +149,8 @@ def capture_browser_result_for_entry(entry, data_dir, browser_result):
         return entry
 
     if status == "blocked":
+        if entry.get("sourceKey") == "xhs" and (entry.get("content") or {}).get("status") == "ready":
+            return entry
         html_path = write_browser_html_snapshot(entry, browser_result, data_dir)
         entry["content"] = {
             "status": "blocked",

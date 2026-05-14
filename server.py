@@ -2180,7 +2180,7 @@ def process_link_with_browser_profile(
     browser_result = fetch_with_browser_profile(
         entry.get("url"),
         DATA_DIR,
-        reuse_existing=allow_visible_browser,
+        reuse_existing=allow_visible_browser or should_prefer_rendered_capture,
         prefer_existing_tab=prefer_existing_browser_tab,
         require_existing_browser=require_existing_browser,
         require_existing_tab=require_existing_browser_tab,
@@ -2361,18 +2361,6 @@ def profile_open_worker(entry_id, attempt, worker_key):
                     "lastStatus": last_status,
                 }
             )
-            if browser_closed:
-                current_profile_open["status"] = "closed"
-                current_profile_open["completedAt"] = current_profile_open["lastCheckedAt"]
-                current_profile_open["reason"] = "Clipy 浏览器或当前标签页已关闭"
-                updated["profileOpen"] = current_profile_open
-                updated["processingStatus"] = "ready"
-                try:
-                    updated = build_item_for_entry(updated, DATA_DIR)
-                except Exception:
-                    pass
-                upsert_entry(updated)
-                return
             if content_status == "ready":
                 current_profile_open["lastReadyAt"] = current_profile_open["lastCheckedAt"]
                 current_profile_open["status"] = "complete"
@@ -2380,6 +2368,18 @@ def profile_open_worker(entry_id, attempt, worker_key):
                 updated["profileOpen"] = current_profile_open
                 updated["processingStatus"] = "ready"
                 updated.pop("processingError", None)
+                try:
+                    updated = build_item_for_entry(updated, DATA_DIR)
+                except Exception:
+                    pass
+                upsert_entry(updated)
+                return
+            if browser_closed:
+                current_profile_open["status"] = "closed"
+                current_profile_open["completedAt"] = current_profile_open["lastCheckedAt"]
+                current_profile_open["reason"] = "Clipy 浏览器或当前标签页已关闭"
+                updated["profileOpen"] = current_profile_open
+                updated["processingStatus"] = "ready"
                 try:
                     updated = build_item_for_entry(updated, DATA_DIR)
                 except Exception:
@@ -2468,6 +2468,16 @@ def verification_worker(entry_id):
                 }
             )
 
+            if content_status == "ready":
+                verification["status"] = "complete"
+                verification["completedAt"] = now
+                updated["verification"] = verification
+                updated["processingStatus"] = "ready"
+                updated.pop("processingError", None)
+                updated = build_item_for_entry(updated, DATA_DIR)
+                upsert_entry(updated)
+                return
+
             if browser_closed:
                 verification["status"] = "expired"
                 verification["reason"] = "Clipy 浏览器或当前标签页已关闭，可点击继续"
@@ -2478,16 +2488,6 @@ def verification_worker(entry_id):
                     updated = build_item_for_entry(updated, DATA_DIR)
                 except Exception:
                     pass
-                upsert_entry(updated)
-                return
-
-            if content_status == "ready":
-                verification["status"] = "complete"
-                verification["completedAt"] = now
-                updated["verification"] = verification
-                updated["processingStatus"] = "ready"
-                updated.pop("processingError", None)
-                updated = build_item_for_entry(updated, DATA_DIR)
                 upsert_entry(updated)
                 return
 
