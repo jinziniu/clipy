@@ -284,6 +284,17 @@ async function evaluatePage(client) {
       .filter((image) => image.url && !image.url.startsWith("data:"))
       .filter((image, index, array) => array.findIndex((item) => item.url === image.url) === index)
       .slice(0, 24);
+    const videoImages = Array.from(document.querySelectorAll("video"))
+      .map((video) => ({
+        url: video.poster || "",
+        alt: "视频封面",
+        width: video.videoWidth || video.clientWidth || 0,
+        height: video.videoHeight || video.clientHeight || 0
+      }))
+      .filter((image) => image.url && !image.url.startsWith("data:"));
+    for (const image of videoImages) {
+      if (!images.some((existing) => existing.url === image.url)) images.unshift(image);
+    }
     const shouldInlineImage = (url) => {
       try {
         const parsed = new URL(url, location.href);

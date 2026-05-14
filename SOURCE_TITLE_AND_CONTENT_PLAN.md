@@ -88,8 +88,8 @@ Clipy 现在把“添加收藏”分成两层处理。2026-05-10 起，纯链接
 | 大众点评 | `sources/dianping.js` | 优先用复制分享文本；否则用短链或路径兜底 | 分享文本可靠，短链需要后续解析 | 店铺/笔记正文、地点、评分、评论、图片信息 |
 | 知乎 | `sources/zhihu.js` | 优先用分享文本；否则用问题/文章 ID 兜底 | 中等，纯链接可继续补网页标题 | 问题、回答、文章正文、作者、评论 |
 | X | `sources/x.js` | 分享文本优先；状态链接尝试接口拿 `@用户：正文开头` | 受公开接口和访问限制影响 | 推文全文、引用、线程、回复、媒体 alt text |
-| YouTube | `sources/youtube.js` | 分享文本优先；否则通用网页 metadata | 通常较好 | 视频标题、描述、频道、字幕、章节、评论 |
-| B站 | `sources/bilibili.js` | 分享文本优先；否则用 BV 号请求 B站视频接口 | BV 链接较可靠 | 视频标题、简介、UP主、字幕、弹幕、评论 |
+| YouTube | `sources/youtube.js` | 分享文本优先；否则 oEmbed / 通用网页 metadata | 通常较好 | 字幕、章节、评论、画面关键帧 |
+| B站 | `sources/bilibili.js` | 分享文本优先；否则用 BV 号请求 B站视频接口 | BV 链接较可靠 | 字幕、弹幕、评论、画面关键帧 |
 | 公众号 | `sources/wechat.js` | 分享文本优先；否则读取网页 metadata | 通常较好，但可能被访问限制 | 文章正文、作者、公众号名、发布时间、图片 |
 | 微博 | `sources/weibo.js` | 分享文本优先；状态链接尝试接口拿 `用户：正文开头` | 受登录墙和接口限制影响 | 微博正文、用户、图片/视频、转评赞、评论 |
 | GitHub | `sources/github.js` | 仓库链接优先显示 `owner/repo：描述`；issue/PR 显示仓库和编号 | 公开仓库可靠，私有仓库需要 Clipy 浏览器 profile 登录 | README、仓库元数据、issue/PR 正文、release、代码结构摘要 |
@@ -363,5 +363,5 @@ python3 rebuild_items.py
 - 短链接需要解析跳转后才能知道真实内容，后续可以为每个平台做短链展开。
 - 文件现在已经接入 PDF、docx、pptx、xlsx 文本解析；图片、音频、视频还没有做 OCR、转录或画面理解。
 - 旧版二进制 Office 格式如 `.doc`、`.ppt`、`.xls` 暂未接入，建议后续用 LibreOffice 转成 OpenXML 后再解析。
-- 视频现在只记录跳过状态，还没有做字幕、转录或画面理解。
+- 视频现在已接入第一阶段 metadata-only 保存：YouTube / B站可以生成 `content.md`、封面和“字幕 / 转录”占位；还没有做字幕、音频转录或画面理解。
 - 跟帖/评论还没有保存，后面需要按来源分别设计评论抓取和去噪策略。

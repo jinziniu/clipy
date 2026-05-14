@@ -25,16 +25,6 @@ def capture_markdown_for_entry(entry, data_dir, force=False):
     if not force and entry.get("content", {}).get("status") == "ready" and markdown_path and markdown_path.exists():
         return entry
 
-    source_key = entry.get("sourceKey") or "web"
-    if source_key in VIDEO_SOURCES:
-        entry["content"] = {
-            "status": "skipped_video",
-            "format": "markdown",
-            "reason": "视频内容之后接入专门转录流程",
-            "capturedAt": now_ms(),
-        }
-        return entry
-
     try:
         result = normalize_result(crawl_entry(entry), entry)
         result = enrich_result_from_existing_snapshot(entry, result, data_dir)
@@ -71,6 +61,7 @@ def capture_markdown_for_entry(entry, data_dir, force=False):
         entry["content"] = {
             "status": "ready",
             "format": "markdown",
+            "method": result.get("method") or "content_pipeline",
             "markdownPath": markdown_info["markdownPath"],
             "htmlPath": html_path,
             "assetsPath": markdown_info.get("assetsPath", ""),
@@ -129,6 +120,24 @@ def capture_browser_result_for_entry(entry, data_dir, browser_result):
     captured_at = now_ms()
 
     if (entry.get("sourceKey") or "web") in VIDEO_SOURCES:
+        result = normalize_result(video_result_from_browser(entry, browser_result), entry)
+        if result.get("text") or result.get("images"):
+            markdown_info = write_markdown(entry, result, data_dir)
+            html_path = write_browser_html_snapshot(entry, browser_result, data_dir)
+            entry["content"] = {
+                "status": "ready",
+                "format": "markdown",
+                "method": "video_metadata",
+                "markdownPath": markdown_info["markdownPath"],
+                "assetsPath": markdown_info.get("assetsPath", ""),
+                "htmlPath": html_path,
+                "finalUrl": browser_result.get("finalUrl") or "",
+                "imageCount": markdown_info["imageCount"],
+                "textLength": len(result.get("text") or ""),
+                "capturedAt": captured_at,
+                "transcriptStatus": "pending",
+            }
+            return entry
         entry["content"] = {
             "status": "skipped_video",
             "format": "markdown",
@@ -273,6 +282,8 @@ def write_html_snapshot(entry, html, data_dir):
 
 def crawl_entry(entry):
     source_key = entry.get("sourceKey") or "web"
+    if source_key in VIDEO_SOURCES:
+        return crawl_video_entry(entry)
     if source_key == "x":
         return crawl_x(entry)
     if source_key == "weibo":
@@ -284,6 +295,138 @@ def crawl_entry(entry):
     if source_key == "github":
         return crawl_github(entry)
     return crawl_article_page(entry)
+
+
+def crawl_video_entry(entry):
+    source_key = entry.get("sourceKey") or "web"
+    if source_key == "bilibili":
+        result = crawl_bilibili_video(entry)
+        if result.get("text") or result.get("images"):
+            return result
+    if source_key == "youtube":
+        result = crawl_youtube_video(entry)
+        if result.get("text") or result.get("images"):
+            return result
+
+    page = crawl_article_page(entry)
+    return normalize_video_result(entry, page, method="page_metadata")
+
+
+def crawl_bilibili_video(entry):
+    bvid_match = re.search(r"(BV[0-9A-Za-z]+)", entry.get("url") or "")
+    if not bvid_match:
+        return normalize_video_result(entry, crawl_article_page(entry), method="page_metadata")
+
+    try:
+        data = fetch_json(f"https://api.bilibili.com/x/web-interface/view?bvid={quote(bvid_match.group(1))}", timeout=8)
+    except Exception:
+        return normalize_video_result(entry, crawl_article_page(entry), method="page_metadata")
+
+    video = data.get("data") or {}
+    owner = video.get("owner") or {}
+    stat = video.get("stat") or {}
+    pages = video.get("pages") or []
+    parts = [
+        f"标题：{clean_inline(video.get('title') or entry.get('title') or '')}",
+        f"作者：{clean_inline(owner.get('name') or '')}",
+        f"发布时间：{format_unix_time(video.get('pubdate'))}",
+        f"时长：{format_duration(video.get('duration'))}",
+        f"播放：{stat.get('view') or 0}",
+        f"弹幕：{stat.get('danmaku') or 0}",
+    ]
+    description = clean_text(video.get("desc") or "")
+    if description:
+        parts.extend(["", "## 视频说明", "", description])
+    if pages:
+        parts.extend(["", "## 分 P", ""])
+        for index, page in enumerate(pages[:30], start=1):
+            title = clean_inline(page.get("part") or f"P{index}")
+            duration = format_duration(page.get("duration"))
+            parts.append(f"- P{index} {title}{f' ({duration})' if duration else ''}")
+    parts.extend(["", "## 字幕 / 转录", "", "暂未获得字幕或转录，后续接入视频转录流程。"])
+
+    cover = normalize_media_url(video.get("pic") or "")
+    return {
+        "title": clean_inline(video.get("title") or entry.get("title") or "Bilibili 视频"),
+        "text": clean_text("\n".join(part for part in parts if part is not None)),
+        "author": clean_inline(owner.get("name") or ""),
+        "publishedAt": format_unix_time(video.get("pubdate")),
+        "images": [{"url": cover, "alt": "视频封面"}] if cover else [],
+        "description": description,
+    }
+
+
+def crawl_youtube_video(entry):
+    url = entry.get("url") or ""
+    oembed = {}
+    try:
+        oembed = fetch_json(f"https://www.youtube.com/oembed?url={quote(url, safe='')}&format=json", timeout=8)
+    except Exception:
+        oembed = {}
+
+    page = crawl_article_page(entry)
+    title = clean_inline(oembed.get("title") or page.get("title") or entry.get("title") or "YouTube 视频")
+    author = clean_inline(oembed.get("author_name") or page.get("author") or "")
+    thumbnail = normalize_media_url(oembed.get("thumbnail_url") or "")
+    if thumbnail:
+        page["images"] = dedupe_images([{"url": thumbnail, "alt": "视频封面"}] + (page.get("images") or []))
+    page["title"] = title
+    page["author"] = author
+    return normalize_video_result(entry, page, method="youtube_oembed")
+
+
+def video_result_from_browser(entry, browser_result):
+    result = {
+        "title": clean_inline(browser_result.get("title") or browser_result.get("documentTitle") or entry.get("title") or ""),
+        "text": clean_text(browser_result.get("text") or browser_result.get("description") or ""),
+        "author": clean_inline(browser_result.get("author") or ""),
+        "publishedAt": clean_inline(browser_result.get("publishedAt") or ""),
+        "images": dedupe_images(browser_result.get("images") or []),
+        "description": clean_text(browser_result.get("description") or ""),
+    }
+    return normalize_video_result(entry, result, method="browser_profile")
+
+
+def normalize_video_result(entry, result, method):
+    result = dict(result or {})
+    title = clean_inline(result.get("title") or entry.get("title") or source_video_title(entry))
+    author = clean_inline(result.get("author") or "")
+    published_at = clean_inline(result.get("publishedAt") or "")
+    description = clean_text(result.get("description") or result.get("text") or entry.get("rawText") or "")
+    source_name = entry.get("sourceName") or entry.get("sourceKey") or "视频"
+    lines = [
+        f"标题：{title}",
+        f"来源：{source_name}",
+        f"作者：{author}" if author else "",
+        f"发布时间：{published_at}" if published_at else "",
+        f"原链接：{entry.get('url') or ''}",
+        "",
+        "## 视频说明",
+        "",
+        description or "暂未获得视频说明。",
+        "",
+        "## 字幕 / 转录",
+        "",
+        "暂未获得字幕或转录，后续接入视频转录流程。",
+    ]
+    return {
+        "title": title,
+        "text": clean_text("\n".join(line for line in lines if line is not None)),
+        "author": author,
+        "publishedAt": published_at,
+        "images": dedupe_images(result.get("images") or []),
+        "description": description,
+        "method": method,
+    }
+
+
+def source_video_title(entry):
+    source_key = entry.get("sourceKey") or ""
+    if source_key == "youtube":
+        return "YouTube 视频"
+    if source_key == "bilibili":
+        return "Bilibili 视频"
+    return "视频收藏"
 
 
 def normalize_result(result, entry):
@@ -1492,6 +1635,30 @@ def clean_text(value):
 
 def clean_inline(value):
     return re.sub(r"\s+", " ", clean_text(value)).strip()
+
+
+def format_duration(value):
+    try:
+        seconds = int(value or 0)
+    except (TypeError, ValueError):
+        return ""
+    if seconds <= 0:
+        return ""
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def format_unix_time(value):
+    try:
+        timestamp = int(value or 0)
+    except (TypeError, ValueError):
+        return ""
+    if timestamp <= 0:
+        return ""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
 
 
 def remove_urls(value):

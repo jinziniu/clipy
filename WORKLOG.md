@@ -292,3 +292,13 @@ GET /api/search?q=...
 3. Clean source-specific noise from more platforms.
 4. Add highlight and note support.
 5. Add embedding-based AI Q&A after summary is stable.
+
+### 2026-05-14 Video Metadata First Slice
+
+- Video link sources no longer need to stop at `skipped_video` in the content pipeline.
+- Added a first metadata-only video capture path:
+  - Bilibili BV links use the public video view API for title, owner, publish time, duration, description, parts, stats, and cover.
+  - YouTube links try oEmbed first for title, author, and thumbnail, then fall back to normal page metadata.
+  - Browser-profile captures can now include `<video poster>` images as local cover candidates.
+- Video `content.md` now includes a `## 字幕 / 转录` placeholder so later transcript extraction can append into the same reader/AI flow.
+- This slice does not download full videos and does not perform audio transcription yet.
